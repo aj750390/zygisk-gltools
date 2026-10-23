@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:background="@drawable/bg_overlay_pill"
+    android:paddingHorizontal="14dp"
+    android:paddingVertical="6dp"
+    android:elevation="8dp">
+
+    <TextView
+        android:id="@+id/tvMetrics"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="60 FPS | 38.5°C"
+        android:textColor="#00FF66"
+        android:textStyle="bold"
+        android:textSize="13sp"
+        android:fontFamily="monospace" />
+</LinearLayout>
