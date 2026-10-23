@@ -2,55 +2,43 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <fstream>
-#include <sstream>
-#include <unistd.h>
-#include <chrono>
-#include <thread>
+#include <cstring>
+#include <sys/system_properties.h>
 
 #define LOG_TAG "ZygiskGLTools"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 static GlToolsConfig g_config;
+
 static const GLubyte *(*orig_glGetString)(GLenum name) = nullptr;
-static const GLubyte *(*orig_glGetStringi)(GLenum name, GLuint index) = nullptr;
 static void (*orig_glViewport)(GLint x, GLint y, GLsizei width, GLsizei height) = nullptr;
+static void *(*orig_eglGetProcAddress)(const char *procname) = nullptr;
+static void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
+static int (*orig_system_property_get)(const char *name, char *value) = nullptr;
 
-// Custom glGetString hook
 static const GLubyte *hooked_glGetString(GLenum name) {
-    if (!g_config.enabled) {
-        return orig_glGetString ? orig_glGetString(name) : nullptr;
+    if (g_config.enabled) {
+        switch (name) {
+            case GL_RENDERER:
+                if (!g_config.renderer.empty()) return reinterpret_cast<const GLubyte *>(g_config.renderer.c_str());
+                break;
+            case GL_VENDOR:
+                if (!g_config.vendor.empty()) return reinterpret_cast<const GLubyte *>(g_config.vendor.c_str());
+                break;
+            case GL_VERSION:
+                if (!g_config.version.empty()) return reinterpret_cast<const GLubyte *>(g_config.version.c_str());
+                break;
+            case GL_EXTENSIONS:
+                if (!g_config.extensions.empty()) return reinterpret_cast<const GLubyte *>(g_config.extensions.c_str());
+                break;
+            default:
+                break;
+        }
     }
-
-    switch (name) {
-        case GL_RENDERER:
-            if (!g_config.renderer.empty()) {
-                return reinterpret_cast<const GLubyte *>(g_config.renderer.c_str());
-            }
-            break;
-        case GL_VENDOR:
-            if (!g_config.vendor.empty()) {
-                return reinterpret_cast<const GLubyte *>(g_config.vendor.c_str());
-            }
-            break;
-        case GL_VERSION:
-            if (!g_config.version.empty()) {
-                return reinterpret_cast<const GLubyte *>(g_config.version.c_str());
-            }
-            break;
-        case GL_EXTENSIONS:
-            if (!g_config.extensions.empty()) {
-                return reinterpret_cast<const GLubyte *>(g_config.extensions.c_str());
-            }
-            break;
-        default:
-            break;
-    }
-
     return orig_glGetString ? orig_glGetString(name) : nullptr;
 }
 
-// Custom glViewport hook for resolution downscaling
 static void hooked_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (g_config.enabled && g_config.downscaleFactor > 0.0f && g_config.downscaleFactor < 1.0f) {
         width = static_cast<GLsizei>(width * g_config.downscaleFactor);
@@ -58,38 +46,101 @@ static void hooked_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
         x = static_cast<GLint>(x * g_config.downscaleFactor);
         y = static_cast<GLint>(y * g_config.downscaleFactor);
     }
+    if (orig_glViewport) orig_glViewport(x, y, width, height);
+}
 
-    if (orig_glViewport) {
-        orig_glViewport(x, y, width, height);
+static void *hooked_eglGetProcAddress(const char *procname) {
+    if (g_config.enabled && procname) {
+        if (std::strcmp(procname, "glGetString") == 0) return reinterpret_cast<void *>(hooked_glGetString);
+        if (std::strcmp(procname, "glViewport") == 0) return reinterpret_cast<void *>(hooked_glViewport);
     }
+    return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
+}
+
+static void *hooked_dlsym(void *handle, const char *symbol) {
+    if (g_config.enabled && symbol) {
+        if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hooked_glGetString);
+        if (std::strcmp(symbol, "glViewport") == 0) return reinterpret_cast<void *>(hooked_glViewport);
+        if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hooked_eglGetProcAddress);
+    }
+    return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
+}
+
+static int hooked_system_property_get(const char *name, char *value) {
+    if (g_config.enabled && name && value) {
+        if (std::strcmp(name, "ro.product.model") == 0 && !g_config.model.empty()) {
+            std::strncpy(value, g_config.model.c_str(), PROP_VALUE_MAX);
+            return std::strlen(value);
+        }
+        if (std::strcmp(name, "ro.product.manufacturer") == 0 && !g_config.manufacturer.empty()) {
+            std::strncpy(value, g_config.manufacturer.c_str(), PROP_VALUE_MAX);
+            return std::strlen(value);
+        }
+        if (std::strcmp(name, "ro.product.brand") == 0 && !g_config.brand.empty()) {
+            std::strncpy(value, g_config.brand.c_str(), PROP_VALUE_MAX);
+            return std::strlen(value);
+        }
+        if (std::strcmp(name, "ro.product.device") == 0 && !g_config.device.empty()) {
+            std::strncpy(value, g_config.device.c_str(), PROP_VALUE_MAX);
+            return std::strlen(value);
+        }
+        if (std::strcmp(name, "ro.board.platform") == 0 && !g_config.board.empty()) {
+            std::strncpy(value, g_config.board.c_str(), PROP_VALUE_MAX);
+            return std::strlen(value);
+        }
+    }
+    return orig_system_property_get ? orig_system_property_get(name, value) : 0;
+}
+
+static std::string extractJsonString(const std::string &line) {
+    size_t colon = line.find(':');
+    if (colon == std::string::npos) return "";
+    size_t start = line.find('"', colon);
+    if (start == std::string::npos) return "";
+    size_t end = line.rfind('"');
+    if (end == std::string::npos || end <= start) return "";
+    return line.substr(start + 1, end - start - 1);
 }
 
 bool loadAppConfig(const char *packageName, GlToolsConfig &outConfig) {
-    std::string configPath = "/data/adb/modules/zygisk_gltools/config/";
-    configPath += packageName;
-    configPath += ".json";
+    if (!packageName || packageName[0] == '\0') return false;
 
-    std::ifstream file(configPath);
-    if (!file.is_open()) {
-        return false;
+    std::string paths[] = {
+        std::string("/data/adb/modules/zygisk_gltools/config/") + packageName + ".json",
+        std::string("/data/local/tmp/gltools/") + packageName + ".json"
+    };
+
+    std::ifstream file;
+    for (const auto &path : paths) {
+        file.open(path);
+        if (file.is_open()) {
+            LOGI("Found configuration at: %s", path.c_str());
+            break;
+        }
     }
+    if (!file.is_open()) return false;
 
-    std::string line;
     outConfig.packageName = packageName;
     outConfig.enabled = true;
 
-    // Parse simple key-value JSON
+    std::string line;
     while (std::getline(file, line)) {
         if (line.find("\"enabled\":") != std::string::npos) {
             outConfig.enabled = (line.find("true") != std::string::npos);
         } else if (line.find("\"vendor\":") != std::string::npos) {
-            size_t start = line.find('"', line.find(':') + 1) + 1;
-            size_t end = line.rfind('"');
-            if (start != std::string::npos && end > start) outConfig.vendor = line.substr(start, end - start);
+            outConfig.vendor = extractJsonString(line);
         } else if (line.find("\"renderer\":") != std::string::npos) {
-            size_t start = line.find('"', line.find(':') + 1) + 1;
-            size_t end = line.rfind('"');
-            if (start != std::string::npos && end > start) outConfig.renderer = line.substr(start, end - start);
+            outConfig.renderer = extractJsonString(line);
+        } else if (line.find("\"model\":") != std::string::npos) {
+            outConfig.model = extractJsonString(line);
+        } else if (line.find("\"manufacturer\":") != std::string::npos) {
+            outConfig.manufacturer = extractJsonString(line);
+        } else if (line.find("\"brand\":") != std::string::npos) {
+            outConfig.brand = extractJsonString(line);
+        } else if (line.find("\"device\":") != std::string::npos) {
+            outConfig.device = extractJsonString(line);
+        } else if (line.find("\"board\":") != std::string::npos) {
+            outConfig.board = extractJsonString(line);
         } else if (line.find("\"downscaleFactor\":") != std::string::npos) {
             size_t colon = line.find(':');
             if (colon != std::string::npos) {
@@ -97,30 +148,54 @@ bool loadAppConfig(const char *packageName, GlToolsConfig &outConfig) {
                     outConfig.downscaleFactor = std::stof(line.substr(colon + 1));
                 } catch (...) {}
             }
-        } else if (line.find("\"fpsLimit\":") != std::string::npos) {
-            size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                try {
-                    outConfig.fpsLimit = std::stoi(line.substr(colon + 1));
-                } catch (...) {}
-            }
         }
     }
-
+    file.close();
     return outConfig.enabled;
+}
+
+void spoofJavaBuildProperties(JNIEnv *env, const GlToolsConfig &config) {
+    if (!env || !config.enabled) return;
+
+    jclass buildClass = env->FindClass("android/os/Build");
+    if (!buildClass) {
+        env->ExceptionClear();
+        return;
+    }
+
+    auto setField = [&](const char *name, const std::string &val) {
+        if (val.empty()) return;
+        jfieldID fid = env->GetStaticFieldID(buildClass, name, "Ljava/lang/String;");
+        if (fid) {
+            jstring jVal = env->NewStringUTF(val.c_str());
+            env->SetStaticObjectField(buildClass, fid, jVal);
+            env->DeleteLocalRef(jVal);
+        } else {
+            env->ExceptionClear();
+        }
+    };
+
+    setField("MODEL", config.model);
+    setField("MANUFACTURER", config.manufacturer);
+    setField("BRAND", config.brand);
+    setField("DEVICE", config.device);
+    setField("BOARD", config.board);
+
+    env->DeleteLocalRef(buildClass);
 }
 
 void installGlHooks(zygisk::Api *api, const GlToolsConfig &config) {
     g_config = config;
-    LOGI("Installing GLTools hooks for: %s (Renderer: %s, Scale: %.2f)",
-         config.packageName.c_str(), config.renderer.c_str(), config.downscaleFactor);
+    LOGI("Registering PLT hooks for %s", config.packageName.c_str());
 
-    // Register PLT hooks via Zygisk API for all target GLES libraries
     api->pltHookRegister(".*\\.so$", "glGetString", reinterpret_cast<void *>(hooked_glGetString), reinterpret_cast<void **>(&orig_glGetString));
     api->pltHookRegister(".*\\.so$", "glViewport", reinterpret_cast<void *>(hooked_glViewport), reinterpret_cast<void **>(&orig_glViewport));
+    api->pltHookRegister(".*\\.so$", "eglGetProcAddress", reinterpret_cast<void *>(hooked_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
+    api->pltHookRegister(".*\\.so$", "dlsym", reinterpret_cast<void *>(hooked_dlsym), reinterpret_cast<void **>(&orig_dlsym));
+    api->pltHookRegister(".*\\.so$", "__system_property_get", reinterpret_cast<void *>(hooked_system_property_get), reinterpret_cast<void **>(&orig_system_property_get));
 
     if (api->pltHookCommit()) {
-        LOGI("PLT hooks successfully registered and committed!");
+        LOGI("PLT hooks successfully committed!");
     } else {
         LOGE("Failed to commit PLT hooks!");
     }
