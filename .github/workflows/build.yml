@@ -43,24 +43,43 @@ jobs:
       run: |
         mkdir -p release_package/zygisk
         
-        # Locate and copy compiled Zygisk native libraries for arm64-v8a and armeabi-v7a
-        find app/build/intermediates/cmake -name "libzygisk_gltools.so" | while read -r lib; do
-          if echo "$lib" | grep -q "arm64-v8a"; then
-            cp "$lib" release_package/zygisk/arm64-v8a.so
-          elif echo "$lib" | grep -q "armeabi-v7a"; then
-            cp "$lib" release_package/zygisk/armeabi-v7a.so
-          fi
-        done
+        # Extract native Zygisk libraries directly from the built APK for every architecture
+        APK_PATH=$(find app/build/outputs/apk -name "*debug.apk" | head -n 1)
+        if [ -z "$APK_PATH" ]; then
+          APK_PATH=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+        fi
+        
+        echo "Extracting native libraries from $APK_PATH..."
+        
+        python3 -c "
+        import zipfile, os
+        apk_path = '$APK_PATH'
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            for item in z.namelist():
+                if item.startswith('lib/') and item.endswith('libzygisk_gltools.so'):
+                    abi = item.split('/')[1]
+                    out_path = f'release_package/zygisk/{abi}.so'
+                    with open(out_path, 'wb') as f:
+                        f.write(z.read(item))
+                    print(f'Successfully extracted {out_path} ({os.path.getsize(out_path)} bytes)')
+        "
+        
+        echo "Contents of release_package/zygisk/:"
+        ls -la release_package/zygisk/
+        
+        # Verify at least one library exists
+        if [ -z "$(ls -A release_package/zygisk)" ]; then
+          echo "ERROR: No native libraries were extracted into release_package/zygisk!"
+          exit 1
+        fi
         
         # Copy Magisk scripts and metadata
         cp module/magisk/module.prop release_package/
         cp module/magisk/customize.sh release_package/
         cp module/magisk/service.sh release_package/
         
-        # Bundle the installable companion APK inside the flashable module
-        if [ -f app/build/outputs/apk/debug/app-debug.apk ]; then
-          cp app/build/outputs/apk/debug/app-debug.apk release_package/GLToolsCompanion.apk
-        fi
+        # Bundle companion APK inside flashable module
+        cp "$APK_PATH" release_package/GLToolsCompanion.apk
         
         # Create flashable ZIP
         cd release_package
@@ -71,7 +90,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: GLToolsCompanion-APK
-        path: app/build/outputs/apk/debug/app-debug.apk
+        path: app/build/outputs/apk/*/*.apk
 
     - name: Upload Flashable Magisk Module
       uses: actions/upload-artifact@v4
