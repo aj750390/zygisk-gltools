@@ -1,0 +1,6 @@
+id=zygisk_gltools
+name=Zygisk GLTools
+version=v1.0.0
+versionCode=100
+author=GLTools Next
+description=Next-generation graphics optimizer, GPU spoofer, and resolution downscaler for Android games inspired by GLTools.
