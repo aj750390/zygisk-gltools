@@ -9,42 +9,63 @@
 class GlToolsZygiskModule {
 public:
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) {
-        // Read target application nice_name
-        if (!args || !args->nice_name) return;
-        // JNI strings conversion can be deferred to postAppSpecialize
+        m_shouldHook = false;
+        if (!args || !m_env) return;
+
+        std::string packageName;
+
+        if (args->nice_name) {
+            const char *rawNice = m_env->GetStringUTFChars(args->nice_name, nullptr);
+            if (rawNice) {
+                packageName = rawNice;
+                m_env->ReleaseStringUTFChars(args->nice_name, rawNice);
+            }
+        }
+
+        if (packageName.empty() && args->app_data_dir) {
+            const char *rawDir = m_env->GetStringUTFChars(args->app_data_dir, nullptr);
+            if (rawDir) {
+                std::string path = rawDir;
+                m_env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
+                size_t pos = path.rfind('/');
+                if (pos != std::string::npos && pos + 1 < path.length()) {
+                    packageName = path.substr(pos + 1);
+                }
+            }
+        }
+
+        if (packageName.empty()) return;
+
+        // Reads config as root before privilege drop
+        if (loadAppConfig(packageName.c_str(), m_config)) {
+            LOGI("Target matched in preAppSpecialize: %s (Renderer: %s)", packageName.c_str(), m_config.renderer.c_str());
+            m_shouldHook = true;
+        }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
-        if (!args || !args->nice_name) return;
-
-        // Retrieve package name from /proc/self/cmdline
-        char cmdline[256] = {0};
-        FILE *fp = fopen("/proc/self/cmdline", "r");
-        if (fp) {
-            fread(cmdline, 1, sizeof(cmdline) - 1, fp);
-            fclose(fp);
-        }
-
-        if (cmdline[0] == '\0') return;
-
-        GlToolsConfig config;
-        if (loadAppConfig(cmdline, config)) {
-            LOGI("Found active GLTools configuration for %s! Hooking...", cmdline);
-            installGlHooks(m_api, config);
-        }
+        if (!m_shouldHook) return;
+        installGlHooks(m_api, m_config);
+        spoofJavaBuildProperties(m_env, m_config);
     }
 
-    void setApi(zygisk::Api *api) { m_api = api; }
+    void setContext(zygisk::Api *api, JNIEnv *env) {
+        m_api = api;
+        m_env = env;
+    }
 
 private:
     zygisk::Api *m_api = nullptr;
+    JNIEnv *m_env = nullptr;
+    GlToolsConfig m_config;
+    bool m_shouldHook = false;
 };
 
 static GlToolsZygiskModule g_moduleInstance;
 
 extern "C" [[gnu::visibility("default")]]
 void zygisk_module_entry(zygisk::Api *api, JNIEnv *env) {
-    g_moduleInstance.setApi(api);
+    g_moduleInstance.setContext(api, env);
     static zygisk::ModuleAbi abi = {
         .api_version = ZYGISK_API_VERSION,
         .impl = reinterpret_cast<zygisk::ModuleImpl *>(&g_moduleInstance),
