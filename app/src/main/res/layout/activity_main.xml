@@ -14,20 +14,113 @@
         app:title="@string/app_name"
         app:titleTextColor="#FFFFFF" />
 
-    <LinearLayout
+    <!-- Live OpenGL ES & Zygisk Verification Card -->
+    <com.google.android.material.card.MaterialCardView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:padding="12dp">
+        android:layout_margin="10dp"
+        app:cardBackgroundColor="#1A222C"
+        app:cardCornerRadius="12dp"
+        app:strokeColor="#2E3B4E"
+        app:strokeWidth="1dp">
 
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnToggleHud"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Start Floating HUD"
-            app:cornerRadius="8dp"
-            app:icon="@drawable/ic_speed" />
-    </LinearLayout>
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="LIVE OPENGL ES &amp; HOOK STATUS"
+                    android:textColor="#90CAF9"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvHookStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="CHECKING..."
+                    android:textColor="#FFD54F"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <!-- 1x1 GLSurfaceView to probe real OpenGL ES driver values -->
+                <android.opengl.GLSurfaceView
+                    android:id="@+id/glProbeView"
+                    android:layout_width="1dp"
+                    android:layout_height="1dp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvLiveGlVersion"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="OpenGL ES Version: Detecting..."
+                android:textColor="#00E676"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:fontFamily="monospace" />
+
+            <TextView
+                android:id="@+id/tvLiveGlRenderer"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="GPU Renderer: Detecting..."
+                android:textColor="#FFFFFF"
+                android:textSize="12sp"
+                android:fontFamily="monospace" />
+
+            <TextView
+                android:id="@+id/tvLiveGlVendorModel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="Vendor / Model: Detecting..."
+                android:textColor="#B0BEC5"
+                android:textSize="12sp"
+                android:fontFamily="monospace" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnSelfTest"
+                    android:layout_width="0dp"
+                    android:layout_height="42dp"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp"
+                    android:text="Test Hook Here"
+                    android:textSize="12sp"
+                    app:cornerRadius="8dp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnToggleHud"
+                    android:layout_width="0dp"
+                    android:layout_height="42dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="6dp"
+                    android:text="Floating HUD"
+                    android:textSize="12sp"
+                    app:cornerRadius="8dp"
+                    app:icon="@drawable/ic_speed" />
+            </LinearLayout>
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/rvApps"
