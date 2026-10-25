@@ -30,7 +30,10 @@ data class GameConfig(
     var hardware: String = "qcom",
     var downscaleFactor: Float = 1.0f,
     var fpsLimit: Int = 0,
-    var optimizeTextures: Boolean = false
+    var optimizeTextures: Boolean = false,
+    var forceFp16Shaders: Boolean = false,
+    var shaderPreset: String = "None (Default Game Shaders)",
+    var customGlsl: String = ""
 ) : Serializable {
     companion object {
         val GL_VERSION_PRESETS = listOf(
@@ -39,6 +42,17 @@ data class GameConfig(
             "OpenGL ES 3.1 V@0502.0 (GLTools)",
             "OpenGL ES 3.0 V@0415.0 (GLTools)",
             "OpenGL ES 2.0 (Legacy Mode)"
+        )
+
+        val SHADER_PRESETS = listOf(
+            "None (Default Game Shaders)",
+            "Vibrant HDR (Saturation & Contrast)",
+            "Golden Hour (Warm Sun & Bloom)",
+            "ACES Filmic HDR Tonemap",
+            "Cyberpunk Neon (Cool Contrast)",
+            "Cel-Shading (Toon Posterize)",
+            "Night Vision (Tactical Green)",
+            "Custom GLSL Expression"
         )
 
         val PRESETS = mapOf(
