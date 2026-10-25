@@ -22,6 +22,9 @@ class AppDetailActivity : AppCompatActivity() {
     private lateinit var config: GameConfig
 
     private lateinit var switchActive: SwitchCompat
+    private lateinit var actvShaderPreset: AutoCompleteTextView
+    private lateinit var etCustomGlsl: TextInputEditText
+    private lateinit var switchFp16Shaders: SwitchCompat
     private lateinit var actvPreset: AutoCompleteTextView
     private lateinit var actvGlVersionPreset: AutoCompleteTextView
     private lateinit var etVersion: TextInputEditText
@@ -50,6 +53,9 @@ class AppDetailActivity : AppCompatActivity() {
 
     private fun bindViews() {
         switchActive = findViewById(R.id.switchActive)
+        actvShaderPreset = findViewById(R.id.actvShaderPreset)
+        etCustomGlsl = findViewById(R.id.etCustomGlsl)
+        switchFp16Shaders = findViewById(R.id.switchFp16Shaders)
         actvPreset = findViewById(R.id.actvPreset)
         actvGlVersionPreset = findViewById(R.id.actvGlVersionPreset)
         etVersion = findViewById(R.id.etVersion)
@@ -63,6 +69,19 @@ class AppDetailActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
+        val shaderList = GameConfig.SHADER_PRESETS
+        val shaderAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, shaderList)
+        actvShaderPreset.setAdapter(shaderAdapter)
+
+        actvShaderPreset.setOnItemClickListener { _, _, position, _ ->
+            val selectedShader = shaderList[position]
+            config.shaderPreset = selectedShader
+            if (selectedShader.contains("Custom GLSL") && etCustomGlsl.text.isNullOrBlank()) {
+                etCustomGlsl.setText("color.rgb = pow(color.rgb, vec3(0.85)) * 1.18;")
+            }
+            switchActive.isChecked = true
+        }
+
         val presetKeys = GameConfig.PRESETS.keys.toList()
         val presetAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, presetKeys)
         actvPreset.setAdapter(presetAdapter)
@@ -116,8 +135,10 @@ class AppDetailActivity : AppCompatActivity() {
     }
 
     private fun populateUI() {
-        // Default the switch to ON when opening detail screen so saving immediately activates the profile
-        switchActive.isChecked = if (config.enabled) true else true
+        switchActive.isChecked = true
+        actvShaderPreset.setText(config.shaderPreset, false)
+        etCustomGlsl.setText(config.customGlsl)
+        switchFp16Shaders.isChecked = config.forceFp16Shaders
         actvPreset.setText(config.presetName, false)
         actvGlVersionPreset.setText(config.version, false)
         etVersion.setText(config.version)
@@ -133,6 +154,9 @@ class AppDetailActivity : AppCompatActivity() {
 
     private fun saveChanges() {
         config.enabled = switchActive.isChecked
+        config.shaderPreset = actvShaderPreset.text?.toString()?.trim().orEmpty().ifEmpty { "None (Default Game Shaders)" }
+        config.customGlsl = etCustomGlsl.text?.toString()?.trim().orEmpty()
+        config.forceFp16Shaders = switchFp16Shaders.isChecked
         config.version = etVersion.text?.toString()?.trim().orEmpty().ifEmpty { "OpenGL ES 3.2 V@0615.0 (GLTools)" }
         config.vendor = etVendor.text?.toString()?.trim().orEmpty().ifEmpty { "Qualcomm" }
         config.renderer = etRenderer.text?.toString()?.trim().orEmpty().ifEmpty { "Adreno (TM) 750" }

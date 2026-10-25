@@ -160,7 +160,8 @@ class MainActivity : AppCompatActivity() {
                 device = "e3q",
                 board = "pineapple",
                 hardware = "qcom",
-                downscaleFactor = 1.0f
+                downscaleFactor = 1.0f,
+                shaderPreset = "Vibrant HDR (Saturation & Contrast)"
             )
             val saved = RootConfigManager.saveConfig(testConfig)
             withContext(Dispatchers.Main) {
@@ -214,7 +215,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Sort with enabled apps first, then alphabetically
             loadedList.sortWith(compareByDescending<GameConfig> { it.enabled }.thenBy { it.appName.lowercase() })
 
             withContext(Dispatchers.Main) {
@@ -269,10 +269,11 @@ class MainActivity : AppCompatActivity() {
 
             if (item.enabled) {
                 val scalePct = (item.downscaleFactor * 100).toInt()
-                holder.tvGlVersionColumn.text = "ACTIVE | ${item.version} | ${item.renderer} ($scalePct%)"
+                val shortShader = item.shaderPreset.substringBefore(" (")
+                holder.tvGlVersionColumn.text = "ACTIVE | ${item.version} | Shader: $shortShader | ${item.renderer} ($scalePct%)"
                 holder.tvGlVersionColumn.setTextColor(Color.parseColor("#00E676"))
             } else {
-                holder.tvGlVersionColumn.text = "GLES: Default Driver (Tap to configure)"
+                holder.tvGlVersionColumn.text = "GLES: Default Driver | Shader: None"
                 holder.tvGlVersionColumn.setTextColor(Color.parseColor("#78909C"))
             }
 
@@ -283,7 +284,6 @@ class MainActivity : AppCompatActivity() {
                 holder.ivIcon.setImageResource(android.R.drawable.sym_def_app_icon)
             }
 
-            // Clear listener before setting checked state to avoid RecyclerView recycling triggers
             holder.switchEnable.setOnCheckedChangeListener(null)
             holder.switchEnable.isChecked = item.enabled
 
