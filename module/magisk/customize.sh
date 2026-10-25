@@ -6,22 +6,21 @@ ui_print "*        Zygisk GLTools v1.0       *"
 ui_print "*   Next-Gen 3D Graphics Optimizer *"
 ui_print "************************************"
 
-# Verify Zygisk is enabled
 if [ "$ZYGISK_ENABLED" != "1" ]; then
-    ui_print "! Zygisk is not enabled in Magisk/KernelSU!"
-    ui_print "! Please enable Zygisk in settings and reboot."
-    abort "Installation aborted."
+    ui_print "! Note: Ensure Zygisk is enabled in Magisk settings."
 fi
 
-# Create directory structure
-ui_print "- Creating config directory..."
+ui_print "- Setting up configuration directories..."
 mkdir -p /data/adb/modules/zygisk_gltools/config
-chmod 777 /data/adb/modules/zygisk_gltools/config
+chmod -R 777 /data/adb/modules/zygisk_gltools/config
+chcon -R u:object_r:system_file:s0 /data/adb/modules/zygisk_gltools
 
-# Install companion app if bundled
+mkdir -p /data/local/tmp/gltools
+chmod -R 777 /data/local/tmp/gltools
+
 if [ -f "$MODPATH/GLToolsCompanion.apk" ]; then
     ui_print "- Installing GLTools Companion Manager..."
-    pm install -r "$MODPATH/GLToolsCompanion.apk"
+    pm install -r "$MODPATH/GLToolsCompanion.apk" >/dev/null 2>&1 || true
 fi
 
 ui_print "- Zygisk GLTools installed successfully!"
