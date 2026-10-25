@@ -106,16 +106,28 @@ static int getEncodedGlEsVersionInt() {
     return (g_config.targetGlMajor << 16) | (g_config.targetGlMinor & 0xFFFF);
 }
 
-// Identify fragment output variable in ES 2.0 (gl_FragColor) or ES 3.0+ (out vec4 <name>;)
+// Identify single fragment color output variable; skip MRT GBuffer/depth-only shaders
 static std::string findFragOutputVar(const std::string &src) {
+    // Skip depth-only or shadow-map shaders
+    if (src.find("gl_FragDepth") != std::string::npos) {
+        return "";
+    }
     if (src.find("gl_FragColor") != std::string::npos) {
         return "gl_FragColor";
     }
     try {
         static const std::regex outRegex(R"(\bout\s+(?:(?:lowp|mediump|highp)\s+)?vec4\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;)");
-        std::smatch match;
-        if (std::regex_search(src, match, outRegex)) {
-            return match[1].str();
+        auto begin = std::sregex_iterator(src.begin(), src.end(), outRegex);
+        auto end = std::sregex_iterator();
+        int count = 0;
+        std::string varName;
+        for (auto it = begin; it != end; ++it) {
+            varName = (*it)[1].str();
+            count++;
+        }
+        // Only inject into single-target color passes (skip multi-render-target GBuffer normal/roughness passes)
+        if (count == 1) {
+            return varName;
         }
     } catch (...) {}
     return "";
@@ -146,34 +158,38 @@ static std::string injectGlslShaderEffect(const std::string &src) {
             return modified;
         }
 
+        // All local variables MUST declare explicit 'mediump' precision because OpenGL ES fragment shaders
+        // have no default float precision when the game shader omits a top-level 'precision mediump float;'.
         std::string effectCode;
         if (mode.find("Vibrant HDR") != std::string::npos) {
             effectCode =
-                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    vec3 _glt_sat = mix(vec3(_glt_luma), " + outVar + ".rgb, 1.38);\n"
-                "    _glt_sat = clamp(_glt_sat * 1.08, 0.0, 1.0);\n"
-                "    " + outVar + ".rgb = _glt_sat * _glt_sat * (3.0 - 2.0 * _glt_sat);\n";
+                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_sat = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.36), vec3(0.0));\n"
+                "    " + outVar + ".rgb = _glt_sat * 1.06;\n";
         } else if (mode.find("Golden Hour") != std::string::npos) {
             effectCode =
-                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    vec3 _glt_warm = mix(vec3(_glt_luma), " + outVar + ".rgb, 1.28) * vec3(1.14, 1.03, 0.86);\n"
-                "    " + outVar + ".rgb = clamp(_glt_warm, 0.0, 1.0);\n";
+                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_warm = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.25), vec3(0.0));\n"
+                "    " + outVar + ".rgb = _glt_warm * vec3(1.12, 1.03, 0.88);\n";
         } else if (mode.find("ACES Filmic") != std::string::npos) {
             effectCode =
-                "    vec3 _glt_x = " + outVar + ".rgb * 1.18;\n"
-                "    " + outVar + ".rgb = clamp((_glt_x * (2.51 * _glt_x + 0.03)) / (_glt_x * (2.43 * _glt_x + 0.59) + 0.14), 0.0, 1.0);\n";
+                "    mediump vec3 _glt_x = max(" + outVar + ".rgb * 1.14, vec3(0.0));\n"
+                "    " + outVar + ".rgb = (_glt_x * (2.51 * _glt_x + 0.03)) / (_glt_x * (2.43 * _glt_x + 0.59) + 0.14);\n";
         } else if (mode.find("Cyberpunk Neon") != std::string::npos) {
             effectCode =
-                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    vec3 _glt_neon = mix(vec3(_glt_luma), " + outVar + ".rgb, 1.48) * vec3(0.94, 1.02, 1.18);\n"
-                "    " + outVar + ".rgb = clamp(_glt_neon, 0.0, 1.0);\n";
+                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_neon = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.42), vec3(0.0));\n"
+                "    " + outVar + ".rgb = _glt_neon * vec3(0.94, 1.02, 1.16);\n";
         } else if (mode.find("Cel-Shading") != std::string::npos) {
+            // Hue-preserving luminance cel-shading (prevents neon pink/magenta color shifts)
             effectCode =
-                "    " + outVar + ".rgb = floor(" + outVar + ".rgb * 5.0 + 0.5) / 5.0;\n";
+                "    mediump float _glt_luma = max(dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114)), 0.0001);\n"
+                "    mediump float _glt_toon = (floor(_glt_luma * 6.0) + 0.5) / 6.0;\n"
+                "    " + outVar + ".rgb = " + outVar + ".rgb * mix(1.0, _glt_toon / _glt_luma, 0.85);\n";
         } else if (mode.find("Night Vision") != std::string::npos) {
             effectCode =
-                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    " + outVar + ".rgb = clamp(vec3(0.1, 0.95, 0.2) * pow(_glt_luma, 0.65) * 1.4, 0.0, 1.0);\n";
+                "    mediump float _glt_luma = max(dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114)), 0.0);\n"
+                "    " + outVar + ".rgb = vec3(0.12, 0.95, 0.22) * pow(_glt_luma, 0.75) * 1.35;\n";
         } else if (mode.find("Custom GLSL") != std::string::npos && !g_config.customGlsl.empty()) {
             std::string expr = g_config.customGlsl;
             size_t p = 0;
@@ -195,7 +211,6 @@ static std::string injectGlslShaderEffect(const std::string &src) {
     return modified;
 }
 
-// Native glCreateShader hook
 static GLuint hooked_glCreateShader(GLenum shaderType) {
     GLuint id = orig_glCreateShader ? orig_glCreateShader(shaderType) : 0;
     if (g_config.enabled && id != 0 && shaderType == GL_FRAGMENT_SHADER) {
@@ -205,13 +220,12 @@ static GLuint hooked_glCreateShader(GLenum shaderType) {
     return id;
 }
 
-// Native glShaderSource hook
 static void hooked_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
     if (!orig_glShaderSource) return;
 
     bool isFrag = false;
     if (g_config.enabled && string && count > 0 &&
-        (g_config.forceFp16Shaders || (!g_config.shaderPreset.empty() && g_config.shaderPreset != "None"))) {
+        (g_config.forceFp16Shaders || (!g_config.shaderPreset.empty() && g_config.shaderPreset.find("None") != 0))) {
         std::lock_guard<std::mutex> lock(g_shaderMutex);
         isFrag = (g_fragmentShaders.find(shader) != g_fragmentShaders.end());
     }
@@ -243,24 +257,31 @@ static void hooked_glShaderSource(GLuint shader, GLsizei count, const GLchar *co
     orig_glShaderSource(shader, count, string, length);
 }
 
-// Native glCompileShader hook with automatic safe fallback if modified GLSL fails to compile
 static void hooked_glCompileShader(GLuint shader) {
     if (!orig_glCompileShader) return;
     orig_glCompileShader(shader);
 
-    if (g_config.enabled && orig_glGetShaderiv && orig_glShaderSource) {
-        std::string fallbackSource;
-        {
-            std::lock_guard<std::mutex> lock(g_shaderMutex);
-            auto it = g_originalShaderSources.find(shader);
-            if (it != g_originalShaderSources.end()) {
-                fallbackSource = it->second;
-            }
+    if (!g_config.enabled || !orig_glShaderSource) return;
+
+    std::string fallbackSource;
+    {
+        std::lock_guard<std::mutex> lock(g_shaderMutex);
+        auto it = g_originalShaderSources.find(shader);
+        if (it != g_originalShaderSources.end()) {
+            fallbackSource = it->second;
         }
-        if (!fallbackSource.empty()) {
+    }
+
+    if (!fallbackSource.empty()) {
+        if (!orig_glGetShaderiv && orig_eglGetProcAddress) {
+            orig_glGetShaderiv = reinterpret_cast<void (*)(GLuint, GLenum, GLint *)>(
+                orig_eglGetProcAddress("glGetShaderiv"));
+        }
+        if (orig_glGetShaderiv) {
             GLint status = 1;
             orig_glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
             if (status == 0) {
+                LOGI("Shader %u failed modified compile; restoring original shader source", shader);
                 const GLchar *origPtr = fallbackSource.c_str();
                 GLint origLen = static_cast<GLint>(fallbackSource.size());
                 orig_glShaderSource(shader, 1, &origPtr, &origLen);
@@ -510,6 +531,11 @@ static void processRelocations(uintptr_t base, const ElfW(Sym) *symtab, const ch
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glShaderSource), reinterpret_cast<void **>(&orig_glShaderSource));
         } else if (std::strcmp(symName, "glCompileShader") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glCompileShader), reinterpret_cast<void **>(&orig_glCompileShader));
+        } else if (std::strcmp(symName, "glGetShaderiv") == 0) {
+            void **slot = reinterpret_cast<void **>(gotEntry);
+            if (!orig_glGetShaderiv && *slot) {
+                orig_glGetShaderiv = reinterpret_cast<void (*)(GLuint, GLenum, GLint *)>(*slot);
+            }
         } else if (std::strcmp(symName, "eglGetProcAddress") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
         } else if (std::strcmp(symName, "eglCreateContext") == 0) {
@@ -729,15 +755,30 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     if (!api) return;
     g_config = config;
 
-    orig_glGetString = reinterpret_cast<const GLubyte *(*)(GLenum)>(dlsym(RTLD_DEFAULT, "glGetString"));
-    orig_glGetIntegerv = reinterpret_cast<void (*)(GLenum, GLint *)>(dlsym(RTLD_DEFAULT, "glGetIntegerv"));
-    orig_glViewport = reinterpret_cast<void (*)(GLint, GLint, GLsizei, GLsizei)>(dlsym(RTLD_DEFAULT, "glViewport"));
-    orig_glCreateShader = reinterpret_cast<GLuint (*)(GLenum)>(dlsym(RTLD_DEFAULT, "glCreateShader"));
-    orig_glShaderSource = reinterpret_cast<void (*)(GLuint, GLsizei, const GLchar *const *, const GLint *)>(dlsym(RTLD_DEFAULT, "glShaderSource"));
-    orig_glCompileShader = reinterpret_cast<void (*)(GLuint)>(dlsym(RTLD_DEFAULT, "glCompileShader"));
-    orig_glGetShaderiv = reinterpret_cast<void (*)(GLuint, GLenum, GLint *)>(dlsym(RTLD_DEFAULT, "glGetShaderiv"));
-    orig_eglGetProcAddress = reinterpret_cast<void *(*)(const char *)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
-    orig_eglCreateContext = reinterpret_cast<void *(*)(void *, void *, void *, const int *)>(dlsym(RTLD_DEFAULT, "eglCreateContext"));
+    void *gles2Handle = dlopen("libGLESv2.so", RTLD_LAZY);
+    void *eglHandle = dlopen("libEGL.so", RTLD_LAZY);
+
+    auto resolveSym = [&](const char *sym) -> void * {
+        if (gles2Handle) {
+            void *p = dlsym(gles2Handle, sym);
+            if (p) return p;
+        }
+        if (eglHandle) {
+            void *p = dlsym(eglHandle, sym);
+            if (p) return p;
+        }
+        return dlsym(RTLD_DEFAULT, sym);
+    };
+
+    orig_glGetString = reinterpret_cast<const GLubyte *(*)(GLenum)>(resolveSym("glGetString"));
+    orig_glGetIntegerv = reinterpret_cast<void (*)(GLenum, GLint *)>(resolveSym("glGetIntegerv"));
+    orig_glViewport = reinterpret_cast<void (*)(GLint, GLint, GLsizei, GLsizei)>(resolveSym("glViewport"));
+    orig_glCreateShader = reinterpret_cast<GLuint (*)(GLenum)>(resolveSym("glCreateShader"));
+    orig_glShaderSource = reinterpret_cast<void (*)(GLuint, GLsizei, const GLchar *const *, const GLint *)>(resolveSym("glShaderSource"));
+    orig_glCompileShader = reinterpret_cast<void (*)(GLuint)>(resolveSym("glCompileShader"));
+    orig_glGetShaderiv = reinterpret_cast<void (*)(GLuint, GLenum, GLint *)>(resolveSym("glGetShaderiv"));
+    orig_eglGetProcAddress = reinterpret_cast<void *(*)(const char *)>(resolveSym("eglGetProcAddress"));
+    orig_eglCreateContext = reinterpret_cast<void *(*)(void *, void *, void *, const int *)>(resolveSym("eglCreateContext"));
     orig_dlsym = reinterpret_cast<void *(*)(void *, const char *)>(dlsym(RTLD_DEFAULT, "dlsym"));
     orig_dlopen = reinterpret_cast<void *(*)(const char *, int)>(dlsym(RTLD_DEFAULT, "dlopen"));
     orig_android_dlopen_ext = reinterpret_cast<void *(*)(const char *, int, const void *)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
