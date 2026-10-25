@@ -10,11 +10,13 @@ struct GlToolsConfig {
     bool enabled = false;
     std::string packageName;
 
-    // OpenGL ES Strings
+    // OpenGL ES Strings & Parsed Version
     std::string vendor = "Qualcomm";
     std::string renderer = "Adreno (TM) 750";
-    std::string version = "OpenGL ES 3.2 V@0615.0 (GLTools-Zygisk)";
+    std::string version = "OpenGL ES 3.2 V@0615.0 (GLTools)";
     std::string extensions = "";
+    int targetGlMajor = 3;
+    int targetGlMinor = 2;
 
     // System Properties / Device Emulation
     std::string model = "SM-S928B";
