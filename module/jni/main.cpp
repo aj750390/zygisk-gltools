@@ -6,14 +6,20 @@
 #define LOG_TAG "ZygiskGLTools"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-class GlToolsZygiskModule {
+class GlToolsZygiskModule : public zygisk::ModuleBase {
 public:
-    void preAppSpecialize(zygisk::AppSpecializeArgs *args) {
+    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+        this->m_api = api;
+        this->m_env = env;
+    }
+
+    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         m_shouldHook = false;
-        if (!args || !m_env) return;
+        if (!args || !m_env || !m_api) return;
 
         std::string packageName;
 
+        // 1. Read package name from nice_name
         if (args->nice_name) {
             const char *rawNice = m_env->GetStringUTFChars(args->nice_name, nullptr);
             if (rawNice) {
@@ -22,6 +28,7 @@ public:
             }
         }
 
+        // 2. Fallback to app_data_dir (/data/user/0/<packageName>)
         if (packageName.empty() && args->app_data_dir) {
             const char *rawDir = m_env->GetStringUTFChars(args->app_data_dir, nullptr);
             if (rawDir) {
@@ -34,24 +41,33 @@ public:
             }
         }
 
-        if (packageName.empty()) return;
+        // Strip process suffix if any (e.g. com.example.game:unity -> com.example.game)
+        size_t colonPos = packageName.find(':');
+        if (colonPos != std::string::npos) {
+            packageName = packageName.substr(0, colonPos);
+        }
 
-        // Reads config as root before privilege drop
-        if (loadAppConfig(packageName.c_str(), m_config)) {
-            LOGI("Target matched in preAppSpecialize: %s (Renderer: %s)", packageName.c_str(), m_config.renderer.c_str());
+        if (!packageName.empty() && loadAppConfig(packageName.c_str(), m_config)) {
+            LOGI("Active profile matched for %s (Renderer: %s, Model: %s)",
+                 packageName.c_str(), m_config.renderer.c_str(), m_config.model.c_str());
             m_shouldHook = true;
+        } else {
+            // Unload module from non-target apps to save memory and prevent interference
+            m_api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
         }
     }
 
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!m_shouldHook) return;
         installGlHooks(m_api, m_config);
         spoofJavaBuildProperties(m_env, m_config);
     }
 
-    void setContext(zygisk::Api *api, JNIEnv *env) {
-        m_api = api;
-        m_env = env;
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+        // Never inject into system_server; unload immediately
+        if (m_api) {
+            m_api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        }
     }
 
 private:
@@ -61,22 +77,4 @@ private:
     bool m_shouldHook = false;
 };
 
-static GlToolsZygiskModule g_moduleInstance;
-
-extern "C" [[gnu::visibility("default")]]
-void zygisk_module_entry(zygisk::Api *api, JNIEnv *env) {
-    g_moduleInstance.setContext(api, env);
-    static zygisk::ModuleAbi abi = {
-        .api_version = ZYGISK_API_VERSION,
-        .impl = reinterpret_cast<zygisk::ModuleImpl *>(&g_moduleInstance),
-        .preAppSpecialize = [](zygisk::ModuleImpl *m, zygisk::AppSpecializeArgs *args) {
-            reinterpret_cast<GlToolsZygiskModule *>(m)->preAppSpecialize(args);
-        },
-        .postAppSpecialize = [](zygisk::ModuleImpl *m, const zygisk::AppSpecializeArgs *args) {
-            reinterpret_cast<GlToolsZygiskModule *>(m)->postAppSpecialize(args);
-        },
-        .preServerSpecialize = nullptr,
-        .postServerSpecialize = nullptr,
-    };
-    api->registerModule(&abi);
-}
+REGISTER_ZYGISK_MODULE(GlToolsZygiskModule)
