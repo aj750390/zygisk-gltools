@@ -23,6 +23,7 @@ object RootConfigManager {
     }
 
     fun saveConfig(config: GameConfig): Boolean {
+        val cleanCustomGlsl = config.customGlsl.replace("\n", " ").replace("\r", " ").trim()
         val confContent = buildString {
             appendLine("packageName=${config.packageName}")
             appendLine("enabled=${config.enabled}")
@@ -39,6 +40,9 @@ object RootConfigManager {
             appendLine("downscaleFactor=${config.downscaleFactor}")
             appendLine("fpsLimit=${config.fpsLimit}")
             appendLine("optimizeTextures=${config.optimizeTextures}")
+            appendLine("forceFp16Shaders=${config.forceFp16Shaders}")
+            appendLine("shaderPreset=${config.shaderPreset}")
+            appendLine("customGlsl=$cleanCustomGlsl")
         }
 
         val jsonContent = JSONObject().apply {
@@ -57,6 +61,9 @@ object RootConfigManager {
             put("downscaleFactor", config.downscaleFactor.toDouble())
             put("fpsLimit", config.fpsLimit)
             put("optimizeTextures", config.optimizeTextures)
+            put("forceFp16Shaders", config.forceFp16Shaders)
+            put("shaderPreset", config.shaderPreset)
+            put("customGlsl", cleanCustomGlsl)
         }.toString(2)
 
         val pkg = config.packageName
@@ -135,7 +142,10 @@ EOF_JSON
                     hardware = json.optString("hardware", config.hardware),
                     downscaleFactor = json.optDouble("downscaleFactor", 1.0).toFloat(),
                     fpsLimit = json.optInt("fpsLimit", 0),
-                    optimizeTextures = json.optBoolean("optimizeTextures", false)
+                    optimizeTextures = json.optBoolean("optimizeTextures", false),
+                    forceFp16Shaders = json.optBoolean("forceFp16Shaders", false),
+                    shaderPreset = json.optString("shaderPreset", config.shaderPreset),
+                    customGlsl = json.optString("customGlsl", "")
                 )
             } catch (_: Exception) {
                 return config
@@ -165,6 +175,9 @@ EOF_JSON
                     "downscaleFactor" -> config.downscaleFactor = value.toFloatOrNull() ?: 1.0f
                     "fpsLimit" -> config.fpsLimit = value.toIntOrNull() ?: 0
                     "optimizeTextures" -> config.optimizeTextures = (value == "true" || value == "1")
+                    "forceFp16Shaders" -> config.forceFp16Shaders = (value == "true" || value == "1")
+                    "shaderPreset" -> if (value.isNotEmpty()) config.shaderPreset = value
+                    "customGlsl" -> config.customGlsl = value
                 }
             }
         }
