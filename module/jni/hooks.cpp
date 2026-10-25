@@ -10,6 +10,10 @@
 #include <cstring>
 #include <cstdio>
 #include <set>
+#include <unordered_set>
+#include <unordered_map>
+#include <mutex>
+#include <regex>
 #include <utility>
 #include <sys/sysmacros.h>
 #include <sys/system_properties.h>
@@ -27,6 +31,12 @@
 #ifndef GL_MINOR_VERSION
 #define GL_MINOR_VERSION 0x821C
 #endif
+#ifndef GL_FRAGMENT_SHADER
+#define GL_FRAGMENT_SHADER 0x8B30
+#endif
+#ifndef GL_COMPILE_STATUS
+#define GL_COMPILE_STATUS 0x8B81
+#endif
 #ifndef EGL_CONTEXT_CLIENT_VERSION
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
 #endif
@@ -40,12 +50,22 @@
 #define ELFW_R_SYM(r_info) ELF32_R_SYM(r_info)
 #endif
 
+typedef char GLchar;
+typedef unsigned int GLuint;
+
 static GlToolsConfig g_config;
+static std::mutex g_shaderMutex;
+static std::unordered_set<GLuint> g_fragmentShaders;
+static std::unordered_map<GLuint, std::string> g_originalShaderSources;
 
 // Native function pointers
 static const GLubyte *(*orig_glGetString)(GLenum name) = nullptr;
 static void (*orig_glGetIntegerv)(GLenum pname, GLint *params) = nullptr;
 static void (*orig_glViewport)(GLint x, GLint y, GLsizei width, GLsizei height) = nullptr;
+static GLuint (*orig_glCreateShader)(GLenum shaderType) = nullptr;
+static void (*orig_glShaderSource)(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) = nullptr;
+static void (*orig_glCompileShader)(GLuint shader) = nullptr;
+static void (*orig_glGetShaderiv)(GLuint shader, GLenum pname, GLint *params) = nullptr;
 static void *(*orig_eglGetProcAddress)(const char *procname) = nullptr;
 static void *(*orig_eglCreateContext)(void *dpy, void *config, void *share_context, const int *attrib_list) = nullptr;
 static void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
@@ -86,7 +106,170 @@ static int getEncodedGlEsVersionInt() {
     return (g_config.targetGlMajor << 16) | (g_config.targetGlMinor & 0xFFFF);
 }
 
-// Native glGetString hook
+// Identify fragment output variable in ES 2.0 (gl_FragColor) or ES 3.0+ (out vec4 <name>;)
+static std::string findFragOutputVar(const std::string &src) {
+    if (src.find("gl_FragColor") != std::string::npos) {
+        return "gl_FragColor";
+    }
+    try {
+        static const std::regex outRegex(R"(\bout\s+(?:(?:lowp|mediump|highp)\s+)?vec4\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;)");
+        std::smatch match;
+        if (std::regex_search(src, match, outRegex)) {
+            return match[1].str();
+        }
+    } catch (...) {}
+    return "";
+}
+
+static std::string injectGlslShaderEffect(const std::string &src) {
+    std::string modified = src;
+
+    if (g_config.forceFp16Shaders) {
+        size_t pos = 0;
+        while ((pos = modified.find("highp", pos)) != std::string::npos) {
+            modified.replace(pos, 5, "mediump");
+            pos += 7;
+        }
+    }
+
+    const std::string &mode = g_config.shaderPreset;
+    if (mode.empty() || mode == "None" || mode.find("None") == 0) {
+        return modified;
+    }
+
+    std::string outVar = findFragOutputVar(modified);
+    if (outVar.empty()) return modified;
+
+    try {
+        static const std::regex mainRegex(R"(\bvoid\s+main\s*\(\s*(?:void)?\s*\))");
+        if (!std::regex_search(modified, mainRegex)) {
+            return modified;
+        }
+
+        std::string effectCode;
+        if (mode.find("Vibrant HDR") != std::string::npos) {
+            effectCode =
+                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    vec3 _glt_sat = mix(vec3(_glt_luma), " + outVar + ".rgb, 1.38);\n"
+                "    _glt_sat = clamp(_glt_sat * 1.08, 0.0, 1.0);\n"
+                "    " + outVar + ".rgb = _glt_sat * _glt_sat * (3.0 - 2.0 * _glt_sat);\n";
+        } else if (mode.find("Golden Hour") != std::string::npos) {
+            effectCode =
+                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    vec3 _glt_warm = mix(vec3(_glt_luma), " + outVar + ".rgb, 1.28) * vec3(1.14, 1.03, 0.86);\n"
+                "    " + outVar + ".rgb = clamp(_glt_warm, 0.0, 1.0);\n";
+        } else if (mode.find("ACES Filmic") != std::string::npos) {
+            effectCode =
+                "    vec3 _glt_x = " + outVar + ".rgb * 1.18;\n"
+                "    " + outVar + ".rgb = clamp((_glt_x * (2.51 * _glt_x + 0.03)) / (_glt_x * (2.43 * _glt_x + 0.59) + 0.14), 0.0, 1.0);\n";
+        } else if (mode.find("Cyberpunk Neon") != std::string::npos) {
+            effectCode =
+                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    vec3 _glt_neon = mix(vec3(_glt_luma), " + outVar + ".rgb, 1.48) * vec3(0.94, 1.02, 1.18);\n"
+                "    " + outVar + ".rgb = clamp(_glt_neon, 0.0, 1.0);\n";
+        } else if (mode.find("Cel-Shading") != std::string::npos) {
+            effectCode =
+                "    " + outVar + ".rgb = floor(" + outVar + ".rgb * 5.0 + 0.5) / 5.0;\n";
+        } else if (mode.find("Night Vision") != std::string::npos) {
+            effectCode =
+                "    float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    " + outVar + ".rgb = clamp(vec3(0.1, 0.95, 0.2) * pow(_glt_luma, 0.65) * 1.4, 0.0, 1.0);\n";
+        } else if (mode.find("Custom GLSL") != std::string::npos && !g_config.customGlsl.empty()) {
+            std::string expr = g_config.customGlsl;
+            size_t p = 0;
+            while ((p = expr.find("color", p)) != std::string::npos) {
+                expr.replace(p, 5, outVar);
+                p += outVar.length();
+            }
+            effectCode = "    " + expr + "\n";
+        }
+
+        if (!effectCode.empty()) {
+            modified = std::regex_replace(modified, mainRegex, "void _gltools_orig_main()", std::regex_constants::format_first_only);
+            modified += "\nvoid main() {\n    _gltools_orig_main();\n" + effectCode + "}\n";
+        }
+    } catch (...) {
+        return src;
+    }
+
+    return modified;
+}
+
+// Native glCreateShader hook
+static GLuint hooked_glCreateShader(GLenum shaderType) {
+    GLuint id = orig_glCreateShader ? orig_glCreateShader(shaderType) : 0;
+    if (g_config.enabled && id != 0 && shaderType == GL_FRAGMENT_SHADER) {
+        std::lock_guard<std::mutex> lock(g_shaderMutex);
+        g_fragmentShaders.insert(id);
+    }
+    return id;
+}
+
+// Native glShaderSource hook
+static void hooked_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
+    if (!orig_glShaderSource) return;
+
+    bool isFrag = false;
+    if (g_config.enabled && string && count > 0 &&
+        (g_config.forceFp16Shaders || (!g_config.shaderPreset.empty() && g_config.shaderPreset != "None"))) {
+        std::lock_guard<std::mutex> lock(g_shaderMutex);
+        isFrag = (g_fragmentShaders.find(shader) != g_fragmentShaders.end());
+    }
+
+    if (isFrag) {
+        std::string fullSource;
+        for (GLsizei i = 0; i < count; ++i) {
+            if (!string[i]) continue;
+            if (length && length[i] >= 0) {
+                fullSource.append(string[i], static_cast<size_t>(length[i]));
+            } else {
+                fullSource.append(string[i]);
+            }
+        }
+
+        std::string transformed = injectGlslShaderEffect(fullSource);
+        if (transformed != fullSource) {
+            {
+                std::lock_guard<std::mutex> lock(g_shaderMutex);
+                g_originalShaderSources[shader] = fullSource;
+            }
+            const GLchar *modPtr = transformed.c_str();
+            GLint modLen = static_cast<GLint>(transformed.size());
+            orig_glShaderSource(shader, 1, &modPtr, &modLen);
+            return;
+        }
+    }
+
+    orig_glShaderSource(shader, count, string, length);
+}
+
+// Native glCompileShader hook with automatic safe fallback if modified GLSL fails to compile
+static void hooked_glCompileShader(GLuint shader) {
+    if (!orig_glCompileShader) return;
+    orig_glCompileShader(shader);
+
+    if (g_config.enabled && orig_glGetShaderiv && orig_glShaderSource) {
+        std::string fallbackSource;
+        {
+            std::lock_guard<std::mutex> lock(g_shaderMutex);
+            auto it = g_originalShaderSources.find(shader);
+            if (it != g_originalShaderSources.end()) {
+                fallbackSource = it->second;
+            }
+        }
+        if (!fallbackSource.empty()) {
+            GLint status = 1;
+            orig_glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+            if (status == 0) {
+                const GLchar *origPtr = fallbackSource.c_str();
+                GLint origLen = static_cast<GLint>(fallbackSource.size());
+                orig_glShaderSource(shader, 1, &origPtr, &origLen);
+                orig_glCompileShader(shader);
+            }
+        }
+    }
+}
+
 static const GLubyte *hooked_glGetString(GLenum name) {
     const char *spoofed = getSpoofedGlString(name);
     if (spoofed) {
@@ -95,7 +278,6 @@ static const GLubyte *hooked_glGetString(GLenum name) {
     return orig_glGetString ? orig_glGetString(name) : nullptr;
 }
 
-// Native glGetIntegerv hook (enforces GL_MAJOR_VERSION and GL_MINOR_VERSION)
 static void hooked_glGetIntegerv(GLenum pname, GLint *params) {
     if (orig_glGetIntegerv) {
         orig_glGetIntegerv(pname, params);
@@ -109,21 +291,19 @@ static void hooked_glGetIntegerv(GLenum pname, GLint *params) {
     }
 }
 
-// Native eglCreateContext hook (enforces OpenGL ES 2.0 downgrade limit when ES 2.0 is selected)
 static void *hooked_eglCreateContext(void *dpy, void *config, void *share_context, const int *attrib_list) {
     if (g_config.enabled && g_config.targetGlMajor <= 2 && attrib_list) {
         for (int i = 0; attrib_list[i] != EGL_NONE; i += 2) {
             if (attrib_list[i] == EGL_CONTEXT_CLIENT_VERSION && attrib_list[i + 1] > g_config.targetGlMajor) {
                 LOGI("Blocking OpenGL ES %d.x context creation (enforcing OpenGL ES %d.%d limit)",
                      attrib_list[i + 1], g_config.targetGlMajor, g_config.targetGlMinor);
-                return nullptr; // EGL_NO_CONTEXT
+                return nullptr;
             }
         }
     }
     return orig_eglCreateContext ? orig_eglCreateContext(dpy, config, share_context, attrib_list) : nullptr;
 }
 
-// JNI GLES20.glGetString(int) hook
 static jstring hooked_jni_gles20_glGetString(JNIEnv *env, jclass clazz, jint name) {
     const char *spoofed = getSpoofedGlString(static_cast<GLenum>(name));
     if (spoofed && env) {
@@ -132,7 +312,6 @@ static jstring hooked_jni_gles20_glGetString(JNIEnv *env, jclass clazz, jint nam
     return orig_jni_gles20_glGetString ? orig_jni_gles20_glGetString(env, clazz, name) : nullptr;
 }
 
-// JNI GLES10.glGetString(int) hook
 static jstring hooked_jni_gles10_glGetString(JNIEnv *env, jclass clazz, jint name) {
     const char *spoofed = getSpoofedGlString(static_cast<GLenum>(name));
     if (spoofed && env) {
@@ -141,7 +320,6 @@ static jstring hooked_jni_gles10_glGetString(JNIEnv *env, jclass clazz, jint nam
     return orig_jni_gles10_glGetString ? orig_jni_gles10_glGetString(env, clazz, name) : nullptr;
 }
 
-// JNI GLImpl.glGetString(int) hook
 static jstring hooked_jni_glimpl_glGetString(JNIEnv *env, jobject thiz, jint name) {
     const char *spoofed = getSpoofedGlString(static_cast<GLenum>(name));
     if (spoofed && env) {
@@ -150,7 +328,6 @@ static jstring hooked_jni_glimpl_glGetString(JNIEnv *env, jobject thiz, jint nam
     return orig_jni_glimpl_glGetString ? orig_jni_glimpl_glGetString(env, thiz, name) : nullptr;
 }
 
-// JNI SystemProperties.native_get(String, String) hook
 static jstring hooked_jni_sysprop_get(JNIEnv *env, jclass clazz, jstring keyJ, jstring defJ) {
     if (g_config.enabled && env && keyJ) {
         const char *key = env->GetStringUTFChars(keyJ, nullptr);
@@ -173,7 +350,6 @@ static jstring hooked_jni_sysprop_get(JNIEnv *env, jclass clazz, jstring keyJ, j
     return orig_jni_sysprop_get ? orig_jni_sysprop_get(env, clazz, keyJ, defJ) : defJ;
 }
 
-// JNI SystemProperties.native_get_int(String, int) hook
 static jint hooked_jni_sysprop_get_int(JNIEnv *env, jclass clazz, jstring keyJ, jint defV) {
     if (g_config.enabled && env && keyJ) {
         const char *key = env->GetStringUTFChars(keyJ, nullptr);
@@ -188,7 +364,6 @@ static jint hooked_jni_sysprop_get_int(JNIEnv *env, jclass clazz, jstring keyJ, 
     return orig_jni_sysprop_get_int ? orig_jni_sysprop_get_int(env, clazz, keyJ, defV) : defV;
 }
 
-// Native glViewport hook
 static void hooked_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (g_config.enabled && g_config.downscaleFactor > 0.0f && g_config.downscaleFactor < 1.0f) {
         width = static_cast<GLsizei>(width * g_config.downscaleFactor);
@@ -206,6 +381,9 @@ static void *hooked_eglGetProcAddress(const char *procname) {
         if (std::strcmp(procname, "glGetString") == 0) return reinterpret_cast<void *>(hooked_glGetString);
         if (std::strcmp(procname, "glGetIntegerv") == 0) return reinterpret_cast<void *>(hooked_glGetIntegerv);
         if (std::strcmp(procname, "glViewport") == 0) return reinterpret_cast<void *>(hooked_glViewport);
+        if (std::strcmp(procname, "glCreateShader") == 0) return reinterpret_cast<void *>(hooked_glCreateShader);
+        if (std::strcmp(procname, "glShaderSource") == 0) return reinterpret_cast<void *>(hooked_glShaderSource);
+        if (std::strcmp(procname, "glCompileShader") == 0) return reinterpret_cast<void *>(hooked_glCompileShader);
         if (std::strcmp(procname, "eglCreateContext") == 0) return reinterpret_cast<void *>(hooked_eglCreateContext);
     }
     return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
@@ -216,13 +394,15 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
         if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hooked_glGetString);
         if (std::strcmp(symbol, "glGetIntegerv") == 0) return reinterpret_cast<void *>(hooked_glGetIntegerv);
         if (std::strcmp(symbol, "glViewport") == 0) return reinterpret_cast<void *>(hooked_glViewport);
+        if (std::strcmp(symbol, "glCreateShader") == 0) return reinterpret_cast<void *>(hooked_glCreateShader);
+        if (std::strcmp(symbol, "glShaderSource") == 0) return reinterpret_cast<void *>(hooked_glShaderSource);
+        if (std::strcmp(symbol, "glCompileShader") == 0) return reinterpret_cast<void *>(hooked_glCompileShader);
         if (std::strcmp(symbol, "eglCreateContext") == 0) return reinterpret_cast<void *>(hooked_eglCreateContext);
         if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hooked_eglGetProcAddress);
     }
     return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
 }
 
-// Intercept dynamic library loading (libunity.so, libUE4.so, etc.) and immediately patch new GOT tables
 static void *hooked_dlopen(const char *filename, int flags) {
     void *handle = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
     if (handle && g_config.enabled) {
@@ -279,7 +459,6 @@ static int hooked_system_property_get(const char *name, char *value) {
     return orig_system_property_get ? orig_system_property_get(name, value) : 0;
 }
 
-// Runtime ELF GOT/PLT Patcher via dl_iterate_phdr
 static inline uintptr_t resolveElfPtr(uintptr_t base, uintptr_t ptr) {
     return (ptr < base) ? (base + ptr) : ptr;
 }
@@ -325,6 +504,12 @@ static void processRelocations(uintptr_t base, const ElfW(Sym) *symtab, const ch
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glGetIntegerv), reinterpret_cast<void **>(&orig_glGetIntegerv));
         } else if (std::strcmp(symName, "glViewport") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glViewport), reinterpret_cast<void **>(&orig_glViewport));
+        } else if (std::strcmp(symName, "glCreateShader") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glCreateShader), reinterpret_cast<void **>(&orig_glCreateShader));
+        } else if (std::strcmp(symName, "glShaderSource") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glShaderSource), reinterpret_cast<void **>(&orig_glShaderSource));
+        } else if (std::strcmp(symName, "glCompileShader") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glCompileShader), reinterpret_cast<void **>(&orig_glCompileShader));
         } else if (std::strcmp(symName, "eglGetProcAddress") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
         } else if (std::strcmp(symName, "eglCreateContext") == 0) {
@@ -440,6 +625,9 @@ bool parseConfigContent(const std::string &content, const char *packageName, GlT
             else if (k == "device" && !v.empty()) outConfig.device = v;
             else if (k == "board" && !v.empty()) outConfig.board = v;
             else if (k == "hardware" && !v.empty()) outConfig.hardware = v;
+            else if (k == "shaderPreset" && !v.empty()) outConfig.shaderPreset = v;
+            else if (k == "customGlsl") outConfig.customGlsl = v;
+            else if (k == "forceFp16Shaders") outConfig.forceFp16Shaders = (v == "true" || v == "1");
             else if (k == "downscaleFactor") {
                 try { outConfig.downscaleFactor = std::stof(v); } catch (...) {}
             }
@@ -466,6 +654,8 @@ bool parseConfigContent(const std::string &content, const char *packageName, GlT
         if (!(v = extractJsonField(content, "device")).empty()) outConfig.device = v;
         if (!(v = extractJsonField(content, "board")).empty()) outConfig.board = v;
         if (!(v = extractJsonField(content, "hardware")).empty()) outConfig.hardware = v;
+        if (!(v = extractJsonField(content, "shaderPreset")).empty()) outConfig.shaderPreset = v;
+        if (!(v = extractJsonField(content, "customGlsl")).empty()) outConfig.customGlsl = v;
 
         size_t dsPos = content.find("\"downscaleFactor\"");
         if (dsPos != std::string::npos) {
@@ -539,10 +729,13 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     if (!api) return;
     g_config = config;
 
-    // Resolve default original symbols via dlsym first so they are never null
     orig_glGetString = reinterpret_cast<const GLubyte *(*)(GLenum)>(dlsym(RTLD_DEFAULT, "glGetString"));
     orig_glGetIntegerv = reinterpret_cast<void (*)(GLenum, GLint *)>(dlsym(RTLD_DEFAULT, "glGetIntegerv"));
     orig_glViewport = reinterpret_cast<void (*)(GLint, GLint, GLsizei, GLsizei)>(dlsym(RTLD_DEFAULT, "glViewport"));
+    orig_glCreateShader = reinterpret_cast<GLuint (*)(GLenum)>(dlsym(RTLD_DEFAULT, "glCreateShader"));
+    orig_glShaderSource = reinterpret_cast<void (*)(GLuint, GLsizei, const GLchar *const *, const GLint *)>(dlsym(RTLD_DEFAULT, "glShaderSource"));
+    orig_glCompileShader = reinterpret_cast<void (*)(GLuint)>(dlsym(RTLD_DEFAULT, "glCompileShader"));
+    orig_glGetShaderiv = reinterpret_cast<void (*)(GLuint, GLenum, GLint *)>(dlsym(RTLD_DEFAULT, "glGetShaderiv"));
     orig_eglGetProcAddress = reinterpret_cast<void *(*)(const char *)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
     orig_eglCreateContext = reinterpret_cast<void *(*)(void *, void *, void *, const int *)>(dlsym(RTLD_DEFAULT, "eglCreateContext"));
     orig_dlsym = reinterpret_cast<void *(*)(void *, const char *)>(dlsym(RTLD_DEFAULT, "dlsym"));
@@ -550,7 +743,6 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     orig_android_dlopen_ext = reinterpret_cast<void *(*)(const char *, int, const void *)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
     orig_system_property_get = reinterpret_cast<int (*)(const char *, char *)>(dlsym(RTLD_DEFAULT, "__system_property_get"));
 
-    // 1. Hook Java JNI OpenGL ES and SystemProperties methods
     if (env) {
         JNINativeMethod gles20Methods[] = {
             {"glGetString", "(I)Ljava/lang/String;", reinterpret_cast<void *>(hooked_jni_gles20_glGetString)}
@@ -589,10 +781,8 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
         }
     }
 
-    // 2. Hook all currently loaded ELFs and register dlopen/android_dlopen_ext hooks for newly loaded game engines
     hookAllLoadedElfs();
 
-    // 3. Also register via Zygisk PLT hook API for preloaded system libraries
     FILE *fp = std::fopen("/proc/self/maps", "r");
     if (fp) {
         std::set<std::pair<dev_t, ino_t>> hookedElfs;
@@ -615,6 +805,9 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
                         api->pltHookRegister(dev, ino, "glGetString", reinterpret_cast<void *>(hooked_glGetString), nullptr);
                         api->pltHookRegister(dev, ino, "glGetIntegerv", reinterpret_cast<void *>(hooked_glGetIntegerv), nullptr);
                         api->pltHookRegister(dev, ino, "glViewport", reinterpret_cast<void *>(hooked_glViewport), nullptr);
+                        api->pltHookRegister(dev, ino, "glCreateShader", reinterpret_cast<void *>(hooked_glCreateShader), nullptr);
+                        api->pltHookRegister(dev, ino, "glShaderSource", reinterpret_cast<void *>(hooked_glShaderSource), nullptr);
+                        api->pltHookRegister(dev, ino, "glCompileShader", reinterpret_cast<void *>(hooked_glCompileShader), nullptr);
                         api->pltHookRegister(dev, ino, "eglGetProcAddress", reinterpret_cast<void *>(hooked_eglGetProcAddress), nullptr);
                         api->pltHookRegister(dev, ino, "eglCreateContext", reinterpret_cast<void *>(hooked_eglCreateContext), nullptr);
                         api->pltHookRegister(dev, ino, "dlsym", reinterpret_cast<void *>(hooked_dlsym), nullptr);
@@ -629,7 +822,7 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
         api->pltHookCommit();
     }
 
-    LOGI("GLTools hooks installed for %s [Enforced GLES %d.%d (%s) | GPU: %s]",
+    LOGI("GLTools hooks installed for %s [GLES %d.%d | Shader: %s | GPU: %s]",
          config.packageName.c_str(), config.targetGlMajor, config.targetGlMinor,
-         config.version.c_str(), config.renderer.c_str());
+         config.shaderPreset.c_str(), config.renderer.c_str());
 }
