@@ -46,6 +46,7 @@ data class GameConfig(
 
         val SHADER_PRESETS = listOf(
             "None (Default Game Shaders)",
+            "DLSS 5 Ultra (Upscale & Ray Reconstruction)",
             "Vibrant HDR (Saturation & Contrast)",
             "Golden Hour (Warm Sun & Bloom)",
             "ACES Filmic HDR Tonemap",
