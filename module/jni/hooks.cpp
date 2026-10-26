@@ -37,6 +37,18 @@
 #ifndef GL_COMPILE_STATUS
 #define GL_COMPILE_STATUS 0x8B81
 #endif
+#ifndef GL_TEXTURE_2D
+#define GL_TEXTURE_2D 0x0DE1
+#endif
+#ifndef GL_TEXTURE_MIN_FILTER
+#define GL_TEXTURE_MIN_FILTER 0x2801
+#endif
+#ifndef GL_TEXTURE_MAG_FILTER
+#define GL_TEXTURE_MAG_FILTER 0x2800
+#endif
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
 #ifndef EGL_CONTEXT_CLIENT_VERSION
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
 #endif
@@ -52,6 +64,7 @@
 
 typedef char GLchar;
 typedef unsigned int GLuint;
+typedef float GLfloat;
 
 static GlToolsConfig g_config;
 static std::mutex g_shaderMutex;
@@ -66,6 +79,8 @@ static GLuint (*orig_glCreateShader)(GLenum shaderType) = nullptr;
 static void (*orig_glShaderSource)(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) = nullptr;
 static void (*orig_glCompileShader)(GLuint shader) = nullptr;
 static void (*orig_glGetShaderiv)(GLuint shader, GLenum pname, GLint *params) = nullptr;
+static void (*orig_glTexParameteri)(GLenum target, GLenum pname, GLint param) = nullptr;
+static void (*orig_glTexParameterf)(GLenum target, GLenum pname, GLfloat param) = nullptr;
 static void *(*orig_eglGetProcAddress)(const char *procname) = nullptr;
 static void *(*orig_eglCreateContext)(void *dpy, void *config, void *share_context, const int *attrib_list) = nullptr;
 static void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
@@ -156,32 +171,15 @@ static std::string injectGlslShaderEffect(const std::string &src) {
             return modified;
         }
 
-        const bool isEs3 = (modified.find("#version 3") != std::string::npos);
-
-        // Rules for 100% mobile GPU compatibility across ES 2.0 and ES 3.x:
-        // 1. Every variable MUST have 'mediump' precision qualifier.
-        // 2. Vector additions/subtractions must use vec3(...) rather than scalar floats.
-        // 3. Clamp HDR inputs before squaring so FP16 (max 65504) never overflows to Inf/NaN (black pixels).
+        // All presets use the exact proven scale-preserving (PreExposure-safe) 3-line structure
+        // (dot -> max(mix(...), vec3(0.0)) -> * vec3(...)) with explicit 'mediump' qualifiers
+        // and zero upper-bound clamping so Unreal Engine 4 HDR passes never crush to black.
         std::string effectCode;
         if (mode.find("DLSS 5") != std::string::npos) {
-            if (isEs3) {
-                // Hardware 2x2 quad derivative Contrast-Adaptive Sharpening (CAS) + Ray-Reconstructed GI & Specular
-                effectCode =
-                    "    mediump vec3 _glt_c = clamp(" + outVar + ".rgb, vec3(0.0), vec3(4.0));\n"
-                    "    mediump vec3 _glt_dx = dFdx(_glt_c);\n"
-                    "    mediump vec3 _glt_dy = dFdy(_glt_c);\n"
-                    "    mediump vec3 _glt_edge = clamp(abs(_glt_dx) + abs(_glt_dy), vec3(0.0), vec3(1.0));\n"
-                    "    mediump vec3 _glt_sharp = _glt_c + (_glt_dx + _glt_dy) * (vec3(0.65) * (vec3(1.0) - _glt_edge));\n"
-                    "    mediump float _glt_luma = dot(_glt_sharp, vec3(0.299, 0.587, 0.114));\n"
-                    "    mediump vec3 _glt_gi = max(mix(vec3(_glt_luma), _glt_sharp, 1.24), vec3(0.0));\n"
-                    "    " + outVar + ".rgb = _glt_gi * (_glt_gi * 0.16 + vec3(0.90));\n";
-            } else {
-                effectCode =
-                    "    mediump vec3 _glt_c = clamp(" + outVar + ".rgb, vec3(0.0), vec3(4.0));\n"
-                    "    mediump float _glt_luma = dot(_glt_c, vec3(0.299, 0.587, 0.114));\n"
-                    "    mediump vec3 _glt_gi = max(mix(vec3(_glt_luma), _glt_c, 1.26), vec3(0.0));\n"
-                    "    " + outVar + ".rgb = _glt_gi * (_glt_gi * 0.16 + vec3(0.90));\n";
-            }
+            effectCode =
+                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_dlss = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.32), vec3(0.0));\n"
+                "    " + outVar + ".rgb = _glt_dlss * vec3(1.06, 1.07, 1.09);\n";
         } else if (mode.find("Vibrant HDR") != std::string::npos) {
             effectCode =
                 "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
@@ -193,10 +191,10 @@ static std::string injectGlslShaderEffect(const std::string &src) {
                 "    mediump vec3 _glt_warm = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.25), vec3(0.0));\n"
                 "    " + outVar + ".rgb = _glt_warm * vec3(1.12, 1.03, 0.88);\n";
         } else if (mode.find("ACES Filmic") != std::string::npos) {
-            // Fixed: clamp to [0, 8] to prevent FP16 (mediump) squaring overflow to Inf/NaN, and use vec3() constants
             effectCode =
-                "    mediump vec3 _glt_x = clamp(" + outVar + ".rgb * 1.14, vec3(0.0), vec3(8.0));\n"
-                "    " + outVar + ".rgb = (_glt_x * (_glt_x * 2.51 + vec3(0.03))) / (_glt_x * (_glt_x * 2.43 + vec3(0.59)) + vec3(0.14));\n";
+                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_film = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.20), vec3(0.0));\n"
+                "    " + outVar + ".rgb = _glt_film * vec3(1.08, 1.02, 0.94);\n";
         } else if (mode.find("Cyberpunk Neon") != std::string::npos) {
             effectCode =
                 "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
@@ -230,6 +228,29 @@ static std::string injectGlslShaderEffect(const std::string &src) {
     }
 
     return modified;
+}
+
+// Hardware 16x Anisotropic Texture Filtering hook for DLSS 5 Ultra mode
+static void hooked_glTexParameteri(GLenum target, GLenum pname, GLint param) {
+    if (orig_glTexParameteri) {
+        orig_glTexParameteri(target, pname, param);
+    }
+    if (g_config.enabled && orig_glTexParameterf &&
+        target == GL_TEXTURE_2D && (pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER) &&
+        g_config.shaderPreset.find("DLSS 5") != std::string::npos) {
+        orig_glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
+    }
+}
+
+static void hooked_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
+    if (orig_glTexParameterf) {
+        orig_glTexParameterf(target, pname, param);
+        if (g_config.enabled &&
+            target == GL_TEXTURE_2D && (pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER) &&
+            g_config.shaderPreset.find("DLSS 5") != std::string::npos) {
+            orig_glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
+        }
+    }
 }
 
 static GLuint hooked_glCreateShader(GLenum shaderType) {
@@ -426,6 +447,8 @@ static void *hooked_eglGetProcAddress(const char *procname) {
         if (std::strcmp(procname, "glCreateShader") == 0) return reinterpret_cast<void *>(hooked_glCreateShader);
         if (std::strcmp(procname, "glShaderSource") == 0) return reinterpret_cast<void *>(hooked_glShaderSource);
         if (std::strcmp(procname, "glCompileShader") == 0) return reinterpret_cast<void *>(hooked_glCompileShader);
+        if (std::strcmp(procname, "glTexParameteri") == 0) return reinterpret_cast<void *>(hooked_glTexParameteri);
+        if (std::strcmp(procname, "glTexParameterf") == 0) return reinterpret_cast<void *>(hooked_glTexParameterf);
         if (std::strcmp(procname, "eglCreateContext") == 0) return reinterpret_cast<void *>(hooked_eglCreateContext);
     }
     return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
@@ -439,6 +462,8 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
         if (std::strcmp(symbol, "glCreateShader") == 0) return reinterpret_cast<void *>(hooked_glCreateShader);
         if (std::strcmp(symbol, "glShaderSource") == 0) return reinterpret_cast<void *>(hooked_glShaderSource);
         if (std::strcmp(symbol, "glCompileShader") == 0) return reinterpret_cast<void *>(hooked_glCompileShader);
+        if (std::strcmp(symbol, "glTexParameteri") == 0) return reinterpret_cast<void *>(hooked_glTexParameteri);
+        if (std::strcmp(symbol, "glTexParameterf") == 0) return reinterpret_cast<void *>(hooked_glTexParameterf);
         if (std::strcmp(symbol, "eglCreateContext") == 0) return reinterpret_cast<void *>(hooked_eglCreateContext);
         if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hooked_eglGetProcAddress);
     }
@@ -552,6 +577,10 @@ static void processRelocations(uintptr_t base, const ElfW(Sym) *symtab, const ch
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glShaderSource), reinterpret_cast<void **>(&orig_glShaderSource));
         } else if (std::strcmp(symName, "glCompileShader") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glCompileShader), reinterpret_cast<void **>(&orig_glCompileShader));
+        } else if (std::strcmp(symName, "glTexParameteri") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glTexParameteri), reinterpret_cast<void **>(&orig_glTexParameteri));
+        } else if (std::strcmp(symName, "glTexParameterf") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glTexParameterf), reinterpret_cast<void **>(&orig_glTexParameterf));
         } else if (std::strcmp(symName, "glGetShaderiv") == 0) {
             void **slot = reinterpret_cast<void **>(gotEntry);
             if (!orig_glGetShaderiv && *slot) {
@@ -798,6 +827,8 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     orig_glShaderSource = reinterpret_cast<void (*)(GLuint, GLsizei, const GLchar *const *, const GLint *)>(resolveSym("glShaderSource"));
     orig_glCompileShader = reinterpret_cast<void (*)(GLuint)>(resolveSym("glCompileShader"));
     orig_glGetShaderiv = reinterpret_cast<void (*)(GLuint, GLenum, GLint *)>(resolveSym("glGetShaderiv"));
+    orig_glTexParameteri = reinterpret_cast<void (*)(GLenum, GLenum, GLint)>(resolveSym("glTexParameteri"));
+    orig_glTexParameterf = reinterpret_cast<void (*)(GLenum, GLenum, GLfloat)>(resolveSym("glTexParameterf"));
     orig_eglGetProcAddress = reinterpret_cast<void *(*)(const char *)>(resolveSym("eglGetProcAddress"));
     orig_eglCreateContext = reinterpret_cast<void *(*)(void *, void *, void *, const int *)>(resolveSym("eglCreateContext"));
     orig_dlsym = reinterpret_cast<void *(*)(void *, const char *)>(dlsym(RTLD_DEFAULT, "dlsym"));
@@ -870,6 +901,8 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
                         api->pltHookRegister(dev, ino, "glCreateShader", reinterpret_cast<void *>(hooked_glCreateShader), nullptr);
                         api->pltHookRegister(dev, ino, "glShaderSource", reinterpret_cast<void *>(hooked_glShaderSource), nullptr);
                         api->pltHookRegister(dev, ino, "glCompileShader", reinterpret_cast<void *>(hooked_glCompileShader), nullptr);
+                        api->pltHookRegister(dev, ino, "glTexParameteri", reinterpret_cast<void *>(hooked_glTexParameteri), nullptr);
+                        api->pltHookRegister(dev, ino, "glTexParameterf", reinterpret_cast<void *>(hooked_glTexParameterf), nullptr);
                         api->pltHookRegister(dev, ino, "eglGetProcAddress", reinterpret_cast<void *>(hooked_eglGetProcAddress), nullptr);
                         api->pltHookRegister(dev, ino, "eglCreateContext", reinterpret_cast<void *>(hooked_eglCreateContext), nullptr);
                         api->pltHookRegister(dev, ino, "dlsym", reinterpret_cast<void *>(hooked_dlsym), nullptr);
