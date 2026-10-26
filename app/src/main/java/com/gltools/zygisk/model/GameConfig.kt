@@ -33,7 +33,8 @@ data class GameConfig(
     var optimizeTextures: Boolean = false,
     var forceFp16Shaders: Boolean = false,
     var shaderPreset: String = "None (Default Game Shaders)",
-    var customGlsl: String = ""
+    var customGlsl: String = "",
+    var frameGenMode: String = "Off (Native Framerate)"
 ) : Serializable {
     companion object {
         val GL_VERSION_PRESETS = listOf(
@@ -54,6 +55,13 @@ data class GameConfig(
             "Cel-Shading (Toon Posterize)",
             "Night Vision (Tactical Green)",
             "Custom GLSL Expression"
+        )
+
+        val FRAME_GEN_PRESETS = listOf(
+            "Off (Native Framerate)",
+            "2x Frame Generation (DLSS-FG Fluid Motion)",
+            "3x Frame Generation (DLSS 5 Multi-Frame Gen)",
+            "VSync Uncap Only (Zero Input Lag)"
         )
 
         val PRESETS = mapOf(
