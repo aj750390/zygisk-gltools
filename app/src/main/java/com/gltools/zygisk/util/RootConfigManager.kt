@@ -43,6 +43,7 @@ object RootConfigManager {
             appendLine("forceFp16Shaders=${config.forceFp16Shaders}")
             appendLine("shaderPreset=${config.shaderPreset}")
             appendLine("customGlsl=$cleanCustomGlsl")
+            appendLine("frameGenMode=${config.frameGenMode}")
         }
 
         val jsonContent = JSONObject().apply {
@@ -64,6 +65,7 @@ object RootConfigManager {
             put("forceFp16Shaders", config.forceFp16Shaders)
             put("shaderPreset", config.shaderPreset)
             put("customGlsl", cleanCustomGlsl)
+            put("frameGenMode", config.frameGenMode)
         }.toString(2)
 
         val pkg = config.packageName
@@ -145,7 +147,8 @@ EOF_JSON
                     optimizeTextures = json.optBoolean("optimizeTextures", false),
                     forceFp16Shaders = json.optBoolean("forceFp16Shaders", false),
                     shaderPreset = json.optString("shaderPreset", config.shaderPreset),
-                    customGlsl = json.optString("customGlsl", "")
+                    customGlsl = json.optString("customGlsl", ""),
+                    frameGenMode = json.optString("frameGenMode", config.frameGenMode)
                 )
             } catch (_: Exception) {
                 return config
@@ -178,6 +181,7 @@ EOF_JSON
                     "forceFp16Shaders" -> config.forceFp16Shaders = (value == "true" || value == "1")
                     "shaderPreset" -> if (value.isNotEmpty()) config.shaderPreset = value
                     "customGlsl" -> config.customGlsl = value
+                    "frameGenMode" -> if (value.isNotEmpty()) config.frameGenMode = value
                 }
             }
         }
