@@ -26,13 +26,14 @@ struct GlToolsConfig {
     std::string board = "pineapple";
     std::string hardware = "qcom";
 
-    // Optimization & Custom Shader Engine Settings
+    // Optimization, Custom Shaders & Frame Generation Settings
     float downscaleFactor = 1.0f;
     int fpsLimit = 0;
     bool optimizeTextures = false;
     bool forceFp16Shaders = false;
     std::string shaderPreset = "None";
     std::string customGlsl = "";
+    std::string frameGenMode = "Off (Native Framerate)";
 };
 
 bool parseConfigContent(const std::string &content, const char *packageName, GlToolsConfig &outConfig);

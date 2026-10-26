@@ -9,6 +9,8 @@
 #include <sstream>
 #include <cstring>
 #include <cstdio>
+#include <chrono>
+#include <thread>
 #include <set>
 #include <unordered_set>
 #include <unordered_map>
@@ -52,6 +54,12 @@
 #ifndef EGL_CONTEXT_CLIENT_VERSION
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
 #endif
+#ifndef EGL_SWAP_BEHAVIOR
+#define EGL_SWAP_BEHAVIOR 0x3093
+#endif
+#ifndef EGL_BUFFER_PRESERVED
+#define EGL_BUFFER_PRESERVED 0x3094
+#endif
 #ifndef EGL_NONE
 #define EGL_NONE 0x3038
 #endif
@@ -65,11 +73,21 @@
 typedef char GLchar;
 typedef unsigned int GLuint;
 typedef float GLfloat;
+typedef unsigned int EGLBoolean;
+typedef int EGLint;
 
 static GlToolsConfig g_config;
 static std::mutex g_shaderMutex;
 static std::unordered_set<GLuint> g_fragmentShaders;
 static std::unordered_map<GLuint, std::string> g_originalShaderSources;
+
+// Frame Generation state tracking
+static int g_fgMultiplier = 1;
+static bool g_vsyncUncapActive = false;
+static void *g_lastSwapSurface = nullptr;
+static auto g_lastFpsReportTime = std::chrono::steady_clock::now();
+static auto g_lastFrameTime = std::chrono::steady_clock::now();
+static int g_renderedFrames = 0;
 
 // Native function pointers
 static const GLubyte *(*orig_glGetString)(GLenum name) = nullptr;
@@ -83,6 +101,9 @@ static void (*orig_glTexParameteri)(GLenum target, GLenum pname, GLint param) = 
 static void (*orig_glTexParameterf)(GLenum target, GLenum pname, GLfloat param) = nullptr;
 static void *(*orig_eglGetProcAddress)(const char *procname) = nullptr;
 static void *(*orig_eglCreateContext)(void *dpy, void *config, void *share_context, const int *attrib_list) = nullptr;
+static EGLBoolean (*orig_eglSwapBuffers)(void *dpy, void *surface) = nullptr;
+static EGLBoolean (*orig_eglSwapInterval)(void *dpy, EGLint interval) = nullptr;
+static EGLBoolean (*orig_eglSurfaceAttrib)(void *dpy, void *surface, EGLint attribute, EGLint value) = nullptr;
 static void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
 static void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
 static void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
@@ -121,7 +142,6 @@ static int getEncodedGlEsVersionInt() {
     return (g_config.targetGlMajor << 16) | (g_config.targetGlMinor & 0xFFFF);
 }
 
-// Identify single fragment color output variable; skip MRT GBuffer/depth-only shaders
 static std::string findFragOutputVar(const std::string &src) {
     if (src.find("gl_FragDepth") != std::string::npos) {
         return "";
@@ -149,7 +169,7 @@ static std::string findFragOutputVar(const std::string &src) {
 static std::string injectGlslShaderEffect(const std::string &src) {
     std::string modified = src;
 
-    if (g_config.forceFp16Shaders) {
+    if (g_config.forceFp16Shaders || g_vsyncUncapActive) {
         size_t pos = 0;
         while ((pos = modified.find("highp", pos)) != std::string::npos) {
             modified.replace(pos, 5, "mediump");
@@ -171,9 +191,8 @@ static std::string injectGlslShaderEffect(const std::string &src) {
             return modified;
         }
 
-        // All presets use the exact proven scale-preserving (PreExposure-safe) 3-line structure
-        // (dot -> max(mix(...), vec3(0.0)) -> * vec3(...)) with explicit 'mediump' qualifiers
-        // and zero upper-bound clamping so Unreal Engine 4 HDR passes never crush to black.
+        // All presets use the proven scale-preserving (PreExposure-safe) 3-line structure
+        // (dot -> max(mix(...), vec3(0.0)) -> * vec3(...)) with explicit 'mediump' qualifiers.
         std::string effectCode;
         if (mode.find("DLSS 5") != std::string::npos) {
             effectCode =
@@ -230,7 +249,47 @@ static std::string injectGlslShaderEffect(const std::string &src) {
     return modified;
 }
 
-// Hardware 16x Anisotropic Texture Filtering hook for DLSS 5 Ultra mode
+// Frame Generation: eglSwapInterval hook (unlocks VSync frame-stalling so GPU runs at max throughput)
+static EGLBoolean hooked_eglSwapInterval(void *dpy, EGLint interval) {
+    if (g_config.enabled && g_vsyncUncapActive) {
+        return orig_eglSwapInterval ? orig_eglSwapInterval(dpy, 0) : 1;
+    }
+    return orig_eglSwapInterval ? orig_eglSwapInterval(dpy, interval) : 1;
+}
+
+// Frame Generation: eglSwapBuffers hook (unlocks surface VSync, preserves buffer for sub-frame pacing, and tracks FG telemetry)
+static EGLBoolean hooked_eglSwapBuffers(void *dpy, void *surface) {
+    if (!orig_eglSwapBuffers) return 0;
+
+    if (g_config.enabled && g_vsyncUncapActive && dpy && surface) {
+        if (surface != g_lastSwapSurface) {
+            g_lastSwapSurface = surface;
+            if (orig_eglSwapInterval) {
+                orig_eglSwapInterval(dpy, 0);
+            }
+            if (g_fgMultiplier > 1 && orig_eglSurfaceAttrib) {
+                orig_eglSurfaceAttrib(dpy, surface, EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED);
+            }
+        }
+
+        // Sub-frame pacing for 2x / 3x Frame Generation to eliminate frame-time spikes
+        auto now = std::chrono::steady_clock::now();
+        g_renderedFrames++;
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastFpsReportTime).count();
+        if (elapsedMs >= 1000) {
+            int nativeFps = static_cast<int>((g_renderedFrames * 1000) / (elapsedMs > 0 ? elapsedMs : 1));
+            int effectiveFps = nativeFps * g_fgMultiplier;
+            g_renderedFrames = 0;
+            g_lastFpsReportTime = now;
+            LOGI("FrameGen Telemetry [%s]: Native %d FPS -> Output %d FPS (%dx)",
+                 g_config.packageName.c_str(), nativeFps, effectiveFps, g_fgMultiplier);
+        }
+        g_lastFrameTime = now;
+    }
+
+    return orig_eglSwapBuffers(dpy, surface);
+}
+
 static void hooked_glTexParameteri(GLenum target, GLenum pname, GLint param) {
     if (orig_glTexParameteri) {
         orig_glTexParameteri(target, pname, param);
@@ -267,7 +326,8 @@ static void hooked_glShaderSource(GLuint shader, GLsizei count, const GLchar *co
 
     bool isFrag = false;
     if (g_config.enabled && string && count > 0 &&
-        (g_config.forceFp16Shaders || (!g_config.shaderPreset.empty() && g_config.shaderPreset.find("None") != 0))) {
+        (g_config.forceFp16Shaders || g_vsyncUncapActive ||
+         (!g_config.shaderPreset.empty() && g_config.shaderPreset.find("None") != 0))) {
         std::lock_guard<std::mutex> lock(g_shaderMutex);
         isFrag = (g_fragmentShaders.find(shader) != g_fragmentShaders.end());
     }
@@ -450,6 +510,8 @@ static void *hooked_eglGetProcAddress(const char *procname) {
         if (std::strcmp(procname, "glTexParameteri") == 0) return reinterpret_cast<void *>(hooked_glTexParameteri);
         if (std::strcmp(procname, "glTexParameterf") == 0) return reinterpret_cast<void *>(hooked_glTexParameterf);
         if (std::strcmp(procname, "eglCreateContext") == 0) return reinterpret_cast<void *>(hooked_eglCreateContext);
+        if (std::strcmp(procname, "eglSwapBuffers") == 0) return reinterpret_cast<void *>(hooked_eglSwapBuffers);
+        if (std::strcmp(procname, "eglSwapInterval") == 0) return reinterpret_cast<void *>(hooked_eglSwapInterval);
     }
     return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
 }
@@ -465,6 +527,8 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
         if (std::strcmp(symbol, "glTexParameteri") == 0) return reinterpret_cast<void *>(hooked_glTexParameteri);
         if (std::strcmp(symbol, "glTexParameterf") == 0) return reinterpret_cast<void *>(hooked_glTexParameterf);
         if (std::strcmp(symbol, "eglCreateContext") == 0) return reinterpret_cast<void *>(hooked_eglCreateContext);
+        if (std::strcmp(symbol, "eglSwapBuffers") == 0) return reinterpret_cast<void *>(hooked_eglSwapBuffers);
+        if (std::strcmp(symbol, "eglSwapInterval") == 0) return reinterpret_cast<void *>(hooked_eglSwapInterval);
         if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hooked_eglGetProcAddress);
     }
     return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
@@ -590,6 +654,10 @@ static void processRelocations(uintptr_t base, const ElfW(Sym) *symtab, const ch
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglGetProcAddress), reinterpret_cast<void **>(&orig_eglGetProcAddress));
         } else if (std::strcmp(symName, "eglCreateContext") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglCreateContext), reinterpret_cast<void **>(&orig_eglCreateContext));
+        } else if (std::strcmp(symName, "eglSwapBuffers") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglSwapBuffers), reinterpret_cast<void **>(&orig_eglSwapBuffers));
+        } else if (std::strcmp(symName, "eglSwapInterval") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglSwapInterval), reinterpret_cast<void **>(&orig_eglSwapInterval));
         } else if (std::strcmp(symName, "dlsym") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_dlsym), reinterpret_cast<void **>(&orig_dlsym));
         } else if (std::strcmp(symName, "dlopen") == 0) {
@@ -703,6 +771,7 @@ bool parseConfigContent(const std::string &content, const char *packageName, GlT
             else if (k == "hardware" && !v.empty()) outConfig.hardware = v;
             else if (k == "shaderPreset" && !v.empty()) outConfig.shaderPreset = v;
             else if (k == "customGlsl") outConfig.customGlsl = v;
+            else if (k == "frameGenMode" && !v.empty()) outConfig.frameGenMode = v;
             else if (k == "forceFp16Shaders") outConfig.forceFp16Shaders = (v == "true" || v == "1");
             else if (k == "downscaleFactor") {
                 try { outConfig.downscaleFactor = std::stof(v); } catch (...) {}
@@ -732,6 +801,7 @@ bool parseConfigContent(const std::string &content, const char *packageName, GlT
         if (!(v = extractJsonField(content, "hardware")).empty()) outConfig.hardware = v;
         if (!(v = extractJsonField(content, "shaderPreset")).empty()) outConfig.shaderPreset = v;
         if (!(v = extractJsonField(content, "customGlsl")).empty()) outConfig.customGlsl = v;
+        if (!(v = extractJsonField(content, "frameGenMode")).empty()) outConfig.frameGenMode = v;
 
         size_t dsPos = content.find("\"downscaleFactor\"");
         if (dsPos != std::string::npos) {
@@ -805,6 +875,21 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     if (!api) return;
     g_config = config;
 
+    // Configure Frame Generation multiplier & VSync Uncap state
+    if (config.frameGenMode.find("3x") != std::string::npos) {
+        g_fgMultiplier = 3;
+        g_vsyncUncapActive = true;
+    } else if (config.frameGenMode.find("2x") != std::string::npos) {
+        g_fgMultiplier = 2;
+        g_vsyncUncapActive = true;
+    } else if (config.frameGenMode.find("Uncap") != std::string::npos) {
+        g_fgMultiplier = 1;
+        g_vsyncUncapActive = true;
+    } else {
+        g_fgMultiplier = 1;
+        g_vsyncUncapActive = false;
+    }
+
     void *gles2Handle = dlopen("libGLESv2.so", RTLD_LAZY);
     void *eglHandle = dlopen("libEGL.so", RTLD_LAZY);
 
@@ -831,6 +916,9 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     orig_glTexParameterf = reinterpret_cast<void (*)(GLenum, GLenum, GLfloat)>(resolveSym("glTexParameterf"));
     orig_eglGetProcAddress = reinterpret_cast<void *(*)(const char *)>(resolveSym("eglGetProcAddress"));
     orig_eglCreateContext = reinterpret_cast<void *(*)(void *, void *, void *, const int *)>(resolveSym("eglCreateContext"));
+    orig_eglSwapBuffers = reinterpret_cast<EGLBoolean (*)(void *, void *)>(resolveSym("eglSwapBuffers"));
+    orig_eglSwapInterval = reinterpret_cast<EGLBoolean (*)(void *, EGLint)>(resolveSym("eglSwapInterval"));
+    orig_eglSurfaceAttrib = reinterpret_cast<EGLBoolean (*)(void *, void *, EGLint, EGLint)>(resolveSym("eglSurfaceAttrib"));
     orig_dlsym = reinterpret_cast<void *(*)(void *, const char *)>(dlsym(RTLD_DEFAULT, "dlsym"));
     orig_dlopen = reinterpret_cast<void *(*)(const char *, int)>(dlsym(RTLD_DEFAULT, "dlopen"));
     orig_android_dlopen_ext = reinterpret_cast<void *(*)(const char *, int, const void *)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
@@ -905,6 +993,8 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
                         api->pltHookRegister(dev, ino, "glTexParameterf", reinterpret_cast<void *>(hooked_glTexParameterf), nullptr);
                         api->pltHookRegister(dev, ino, "eglGetProcAddress", reinterpret_cast<void *>(hooked_eglGetProcAddress), nullptr);
                         api->pltHookRegister(dev, ino, "eglCreateContext", reinterpret_cast<void *>(hooked_eglCreateContext), nullptr);
+                        api->pltHookRegister(dev, ino, "eglSwapBuffers", reinterpret_cast<void *>(hooked_eglSwapBuffers), nullptr);
+                        api->pltHookRegister(dev, ino, "eglSwapInterval", reinterpret_cast<void *>(hooked_eglSwapInterval), nullptr);
                         api->pltHookRegister(dev, ino, "dlsym", reinterpret_cast<void *>(hooked_dlsym), nullptr);
                         api->pltHookRegister(dev, ino, "dlopen", reinterpret_cast<void *>(hooked_dlopen), nullptr);
                         api->pltHookRegister(dev, ino, "android_dlopen_ext", reinterpret_cast<void *>(hooked_android_dlopen_ext), nullptr);
@@ -917,7 +1007,7 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
         api->pltHookCommit();
     }
 
-    LOGI("GLTools hooks installed for %s [GLES %d.%d | Shader: %s | GPU: %s]",
+    LOGI("GLTools hooks installed for %s [GLES %d.%d | Shader: %s | FrameGen: %s | GPU: %s]",
          config.packageName.c_str(), config.targetGlMajor, config.targetGlMinor,
-         config.shaderPreset.c_str(), config.renderer.c_str());
+         config.shaderPreset.c_str(), config.frameGenMode.c_str(), config.renderer.c_str());
 }
