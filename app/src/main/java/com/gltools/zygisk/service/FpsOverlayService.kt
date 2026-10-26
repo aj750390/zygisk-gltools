@@ -32,6 +32,7 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
     private var frameCount = 0
     private var lastFpsTimestamp = 0L
     private var currentFps = 60
+    private var fgMultiplier = 1
 
     private val handler = Handler(Looper.getMainLooper())
     private val telemetryRunnable = object : Runnable {
@@ -39,6 +40,11 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
             updateTelemetryDisplay()
             handler.postDelayed(this, 1000)
         }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        fgMultiplier = intent?.getIntExtra("FG_MULTIPLIER", 1) ?: 1
+        return START_STICKY
     }
 
     override fun onCreate() {
@@ -62,7 +68,7 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
 
         val notification: Notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("GLTools Performance HUD")
-            .setContentText("Active overlay measuring FPS & thermals")
+            .setContentText("Active overlay measuring FPS, FrameGen & thermals")
             .setSmallIcon(R.drawable.ic_speed)
             .build()
 
@@ -92,7 +98,6 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
             y = 150
         }
 
-        // Draggable touch listener
         overlayView.setOnTouchListener(object : View.OnTouchListener {
             private var initialX = 0
             private var initialY = 0
@@ -140,7 +145,12 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
         val tempTenths = batteryIntent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
         val tempCelsius = tempTenths / 10.0
 
-        tvMetrics.text = String.format("%d FPS | %.1f°C", currentFps, tempCelsius)
+        if (fgMultiplier > 1) {
+            val fgFps = currentFps * fgMultiplier
+            tvMetrics.text = String.format("%d FPS [FG %dx] | %.1f°C", fgFps, fgMultiplier, tempCelsius)
+        } else {
+            tvMetrics.text = String.format("%d FPS | %.1f°C", currentFps, tempCelsius)
+        }
     }
 
     override fun onDestroy() {
