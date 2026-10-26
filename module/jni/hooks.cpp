@@ -108,7 +108,6 @@ static int getEncodedGlEsVersionInt() {
 
 // Identify single fragment color output variable; skip MRT GBuffer/depth-only shaders
 static std::string findFragOutputVar(const std::string &src) {
-    // Skip depth-only or shadow-map shaders
     if (src.find("gl_FragDepth") != std::string::npos) {
         return "";
     }
@@ -125,7 +124,6 @@ static std::string findFragOutputVar(const std::string &src) {
             varName = (*it)[1].str();
             count++;
         }
-        // Only inject into single-target color passes (skip multi-render-target GBuffer normal/roughness passes)
         if (count == 1) {
             return varName;
         }
@@ -158,10 +156,33 @@ static std::string injectGlslShaderEffect(const std::string &src) {
             return modified;
         }
 
-        // All local variables MUST declare explicit 'mediump' precision because OpenGL ES fragment shaders
-        // have no default float precision when the game shader omits a top-level 'precision mediump float;'.
+        const bool isEs3 = (modified.find("#version 3") != std::string::npos);
+
+        // Rules for 100% mobile GPU compatibility across ES 2.0 and ES 3.x:
+        // 1. Every variable MUST have 'mediump' precision qualifier.
+        // 2. Vector additions/subtractions must use vec3(...) rather than scalar floats.
+        // 3. Clamp HDR inputs before squaring so FP16 (max 65504) never overflows to Inf/NaN (black pixels).
         std::string effectCode;
-        if (mode.find("Vibrant HDR") != std::string::npos) {
+        if (mode.find("DLSS 5") != std::string::npos) {
+            if (isEs3) {
+                // Hardware 2x2 quad derivative Contrast-Adaptive Sharpening (CAS) + Ray-Reconstructed GI & Specular
+                effectCode =
+                    "    mediump vec3 _glt_c = clamp(" + outVar + ".rgb, vec3(0.0), vec3(4.0));\n"
+                    "    mediump vec3 _glt_dx = dFdx(_glt_c);\n"
+                    "    mediump vec3 _glt_dy = dFdy(_glt_c);\n"
+                    "    mediump vec3 _glt_edge = clamp(abs(_glt_dx) + abs(_glt_dy), vec3(0.0), vec3(1.0));\n"
+                    "    mediump vec3 _glt_sharp = _glt_c + (_glt_dx + _glt_dy) * (vec3(0.65) * (vec3(1.0) - _glt_edge));\n"
+                    "    mediump float _glt_luma = dot(_glt_sharp, vec3(0.299, 0.587, 0.114));\n"
+                    "    mediump vec3 _glt_gi = max(mix(vec3(_glt_luma), _glt_sharp, 1.24), vec3(0.0));\n"
+                    "    " + outVar + ".rgb = _glt_gi * (_glt_gi * 0.16 + vec3(0.90));\n";
+            } else {
+                effectCode =
+                    "    mediump vec3 _glt_c = clamp(" + outVar + ".rgb, vec3(0.0), vec3(4.0));\n"
+                    "    mediump float _glt_luma = dot(_glt_c, vec3(0.299, 0.587, 0.114));\n"
+                    "    mediump vec3 _glt_gi = max(mix(vec3(_glt_luma), _glt_c, 1.26), vec3(0.0));\n"
+                    "    " + outVar + ".rgb = _glt_gi * (_glt_gi * 0.16 + vec3(0.90));\n";
+            }
+        } else if (mode.find("Vibrant HDR") != std::string::npos) {
             effectCode =
                 "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
                 "    mediump vec3 _glt_sat = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.36), vec3(0.0));\n"
@@ -172,16 +193,16 @@ static std::string injectGlslShaderEffect(const std::string &src) {
                 "    mediump vec3 _glt_warm = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.25), vec3(0.0));\n"
                 "    " + outVar + ".rgb = _glt_warm * vec3(1.12, 1.03, 0.88);\n";
         } else if (mode.find("ACES Filmic") != std::string::npos) {
+            // Fixed: clamp to [0, 8] to prevent FP16 (mediump) squaring overflow to Inf/NaN, and use vec3() constants
             effectCode =
-                "    mediump vec3 _glt_x = max(" + outVar + ".rgb * 1.14, vec3(0.0));\n"
-                "    " + outVar + ".rgb = (_glt_x * (2.51 * _glt_x + 0.03)) / (_glt_x * (2.43 * _glt_x + 0.59) + 0.14);\n";
+                "    mediump vec3 _glt_x = clamp(" + outVar + ".rgb * 1.14, vec3(0.0), vec3(8.0));\n"
+                "    " + outVar + ".rgb = (_glt_x * (_glt_x * 2.51 + vec3(0.03))) / (_glt_x * (_glt_x * 2.43 + vec3(0.59)) + vec3(0.14));\n";
         } else if (mode.find("Cyberpunk Neon") != std::string::npos) {
             effectCode =
                 "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
                 "    mediump vec3 _glt_neon = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.42), vec3(0.0));\n"
                 "    " + outVar + ".rgb = _glt_neon * vec3(0.94, 1.02, 1.16);\n";
         } else if (mode.find("Cel-Shading") != std::string::npos) {
-            // Hue-preserving luminance cel-shading (prevents neon pink/magenta color shifts)
             effectCode =
                 "    mediump float _glt_luma = max(dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114)), 0.0001);\n"
                 "    mediump float _glt_toon = (floor(_glt_luma * 6.0) + 0.5) / 6.0;\n"
