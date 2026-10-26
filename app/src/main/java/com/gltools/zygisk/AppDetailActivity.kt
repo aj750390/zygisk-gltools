@@ -22,6 +22,7 @@ class AppDetailActivity : AppCompatActivity() {
     private lateinit var config: GameConfig
 
     private lateinit var switchActive: SwitchCompat
+    private lateinit var actvFrameGenMode: AutoCompleteTextView
     private lateinit var actvShaderPreset: AutoCompleteTextView
     private lateinit var etCustomGlsl: TextInputEditText
     private lateinit var switchFp16Shaders: SwitchCompat
@@ -53,6 +54,7 @@ class AppDetailActivity : AppCompatActivity() {
 
     private fun bindViews() {
         switchActive = findViewById(R.id.switchActive)
+        actvFrameGenMode = findViewById(R.id.actvFrameGenMode)
         actvShaderPreset = findViewById(R.id.actvShaderPreset)
         etCustomGlsl = findViewById(R.id.etCustomGlsl)
         switchFp16Shaders = findViewById(R.id.switchFp16Shaders)
@@ -69,6 +71,15 @@ class AppDetailActivity : AppCompatActivity() {
     }
 
     private fun setupListeners() {
+        val frameGenList = GameConfig.FRAME_GEN_PRESETS
+        val frameGenAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, frameGenList)
+        actvFrameGenMode.setAdapter(frameGenAdapter)
+
+        actvFrameGenMode.setOnItemClickListener { _, _, position, _ ->
+            config.frameGenMode = frameGenList[position]
+            switchActive.isChecked = true
+        }
+
         val shaderList = GameConfig.SHADER_PRESETS
         val shaderAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, shaderList)
         actvShaderPreset.setAdapter(shaderAdapter)
@@ -136,6 +147,7 @@ class AppDetailActivity : AppCompatActivity() {
 
     private fun populateUI() {
         switchActive.isChecked = true
+        actvFrameGenMode.setText(config.frameGenMode, false)
         actvShaderPreset.setText(config.shaderPreset, false)
         etCustomGlsl.setText(config.customGlsl)
         switchFp16Shaders.isChecked = config.forceFp16Shaders
@@ -154,6 +166,7 @@ class AppDetailActivity : AppCompatActivity() {
 
     private fun saveChanges() {
         config.enabled = switchActive.isChecked
+        config.frameGenMode = actvFrameGenMode.text?.toString()?.trim().orEmpty().ifEmpty { "Off (Native Framerate)" }
         config.shaderPreset = actvShaderPreset.text?.toString()?.trim().orEmpty().ifEmpty { "None (Default Game Shaders)" }
         config.customGlsl = etCustomGlsl.text?.toString()?.trim().orEmpty()
         config.forceFp16Shaders = switchFp16Shaders.isChecked

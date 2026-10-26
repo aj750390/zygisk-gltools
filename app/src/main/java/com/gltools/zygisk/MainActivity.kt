@@ -161,7 +161,8 @@ class MainActivity : AppCompatActivity() {
                 board = "pineapple",
                 hardware = "qcom",
                 downscaleFactor = 1.0f,
-                shaderPreset = "Vibrant HDR (Saturation & Contrast)"
+                shaderPreset = "DLSS 5 Ultra (Upscale & Ray Reconstruction)",
+                frameGenMode = "2x Frame Generation (DLSS-FG Fluid Motion)"
             )
             val saved = RootConfigManager.saveConfig(testConfig)
             withContext(Dispatchers.Main) {
@@ -232,7 +233,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val serviceIntent = Intent(this, FpsOverlayService::class.java)
+        val activeFgMultiplier = appList.firstOrNull { it.enabled && it.frameGenMode.contains("3x") }?.let { 3 }
+            ?: appList.firstOrNull { it.enabled && it.frameGenMode.contains("2x") }?.let { 2 }
+            ?: 1
+
+        val serviceIntent = Intent(this, FpsOverlayService::class.java).apply {
+            putExtra("FG_MULTIPLIER", activeFgMultiplier)
+        }
         if (!isOverlayRunning) {
             startService(serviceIntent)
             btnToggleHud.text = "Stop HUD"
@@ -270,10 +277,11 @@ class MainActivity : AppCompatActivity() {
             if (item.enabled) {
                 val scalePct = (item.downscaleFactor * 100).toInt()
                 val shortShader = item.shaderPreset.substringBefore(" (")
-                holder.tvGlVersionColumn.text = "ACTIVE | ${item.version} | Shader: $shortShader | ${item.renderer} ($scalePct%)"
+                val shortFg = item.frameGenMode.substringBefore(" (")
+                holder.tvGlVersionColumn.text = "ACTIVE | ${item.version} | Shader: $shortShader | FG: $shortFg | ${item.renderer} ($scalePct%)"
                 holder.tvGlVersionColumn.setTextColor(Color.parseColor("#00E676"))
             } else {
-                holder.tvGlVersionColumn.text = "GLES: Default Driver | Shader: None"
+                holder.tvGlVersionColumn.text = "GLES: Default Driver | Shader: None | FG: Off"
                 holder.tvGlVersionColumn.setTextColor(Color.parseColor("#78909C"))
             }
 
