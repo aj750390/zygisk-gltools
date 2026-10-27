@@ -6,6 +6,7 @@ data class DevicePreset(
     val vendor: String,
     val renderer: String,
     val version: String,
+    val extensions: String,
     val model: String,
     val manufacturer: String,
     val brand: String,
@@ -22,6 +23,8 @@ data class GameConfig(
     var vendor: String = "Qualcomm",
     var renderer: String = "Adreno (TM) 750",
     var version: String = "OpenGL ES 3.2 V@0615.0 (GLTools)",
+    var extensionsPreset: String = "Adreno 750 Flagship Extensions",
+    var extensions: String = EXT_ADRENO_750,
     var model: String = "SM-S928B",
     var manufacturer: String = "samsung",
     var brand: String = "samsung",
@@ -37,6 +40,48 @@ data class GameConfig(
     var frameGenMode: String = "Off (Native Framerate)"
 ) : Serializable {
     companion object {
+        const val EXT_ADRENO_750 =
+            "GL_OES_EGL_image GL_OES_EGL_image_external GL_OES_EGL_sync GL_OES_vertex_half_float " +
+            "GL_OES_framebuffer_object GL_OES_rgb8_rgba8 GL_OES_compressed_ETC1_RGB8_texture " +
+            "GL_AMD_compressed_ATC_texture GL_KHR_texture_compression_astc_ldr GL_KHR_texture_compression_astc_hdr " +
+            "GL_EXT_color_buffer_float GL_EXT_color_buffer_half_float GL_EXT_texture_filter_anisotropic " +
+            "GL_EXT_texture_format_BGRA8888 GL_OES_texture_3D GL_OES_texture_float GL_OES_texture_float_linear " +
+            "GL_OES_texture_half_float GL_OES_texture_half_float_linear GL_OES_texture_npot " +
+            "GL_EXT_shader_framebuffer_fetch GL_QCOM_tiled_rendering GL_QCOM_shading_rate " +
+            "GL_OVR_multiview GL_OVR_multiview2 GL_EXT_Buffer_storage GL_EXT_tessellation_shader " +
+            "GL_EXT_geometry_shader GL_KHR_debug GL_EXT_sRGB"
+
+        const val EXT_MALI_G720 =
+            "GL_OES_EGL_image GL_OES_EGL_image_external GL_OES_compressed_ETC1_RGB8_texture " +
+            "GL_KHR_texture_compression_astc_ldr GL_KHR_texture_compression_astc_hdr " +
+            "GL_KHR_texture_compression_astc_sliced_3d GL_EXT_color_buffer_float GL_EXT_color_buffer_half_float " +
+            "GL_EXT_texture_filter_anisotropic GL_ARM_shader_framebuffer_fetch " +
+            "GL_ARM_shader_framebuffer_fetch_depth_stencil GL_ARM_mali_shader_binary " +
+            "GL_OES_texture_float GL_OES_texture_half_float GL_OES_texture_npot " +
+            "GL_EXT_buffer_storage GL_EXT_tessellation_shader GL_EXT_geometry_shader GL_OVR_multiview2"
+
+        const val EXT_NVIDIA_TEGRA =
+            "GL_OES_EGL_image GL_OES_EGL_image_external GL_OES_compressed_ETC1_RGB8_texture " +
+            "GL_EXT_texture_compression_dxt1 GL_EXT_texture_compression_s3tc GL_NV_texture_compression_s3tc_update " +
+            "GL_KHR_texture_compression_astc_ldr GL_EXT_texture_filter_anisotropic GL_EXT_color_buffer_float " +
+            "GL_NV_depth_nonlinear GL_NV_draw_path GL_NV_framebuffer_blit GL_NV_shadow_samplers_cube " +
+            "GL_OES_texture_float GL_OES_texture_half_float GL_OES_texture_npot GL_EXT_buffer_storage"
+
+        const val EXT_UNIVERSAL_TEXTURES =
+            "GL_OES_EGL_image GL_OES_EGL_image_external GL_OES_compressed_ETC1_RGB8_texture " +
+            "GL_KHR_texture_compression_astc_ldr GL_KHR_texture_compression_astc_hdr " +
+            "GL_EXT_texture_compression_dxt1 GL_EXT_texture_compression_s3tc " +
+            "GL_IMG_texture_compression_pvrtc GL_AMD_compressed_ATC_texture " +
+            "GL_EXT_texture_filter_anisotropic GL_EXT_color_buffer_float GL_OES_texture_float GL_OES_texture_npot"
+
+        val GL_EXTENSIONS_PRESETS = mapOf(
+            "Adreno 750 Flagship Extensions" to EXT_ADRENO_750,
+            "Mali-G720 Immortalis Extensions" to EXT_MALI_G720,
+            "NVIDIA Tegra X1 (S3TC/DXT) Extensions" to EXT_NVIDIA_TEGRA,
+            "Universal Texture Unlock (ASTC+DXT+PVRTC)" to EXT_UNIVERSAL_TEXTURES,
+            "Default (Keep Native GPU Extensions)" to ""
+        )
+
         val GL_VERSION_PRESETS = listOf(
             "OpenGL ES 3.2 V@0615.0 (GLTools)",
             "OpenGL ES 3.2 V@125.0 (Mali Immortalis)",
@@ -69,6 +114,7 @@ data class GameConfig(
                 vendor = "Qualcomm",
                 renderer = "Adreno (TM) 750",
                 version = "OpenGL ES 3.2 V@0615.0 (GLTools)",
+                extensions = EXT_ADRENO_750,
                 model = "SM-S928B",
                 manufacturer = "samsung",
                 brand = "samsung",
@@ -80,6 +126,7 @@ data class GameConfig(
                 vendor = "Qualcomm",
                 renderer = "Adreno (TM) 740",
                 version = "OpenGL ES 3.2 V@0602.0 (GLTools)",
+                extensions = EXT_ADRENO_750,
                 model = "ASUS_AI2205",
                 manufacturer = "asus",
                 brand = "asus",
@@ -91,6 +138,7 @@ data class GameConfig(
                 vendor = "ARM",
                 renderer = "Mali-G720 Immortalis MC12",
                 version = "OpenGL ES 3.2 v1.r46p0 (GLTools)",
+                extensions = EXT_MALI_G720,
                 model = "V2309A",
                 manufacturer = "vivo",
                 brand = "vivo",
@@ -102,6 +150,7 @@ data class GameConfig(
                 vendor = "Apple",
                 renderer = "Apple A17 GPU",
                 version = "OpenGL ES 3.0 Metal-310.1 (GLTools)",
+                extensions = EXT_UNIVERSAL_TEXTURES,
                 model = "iPhone16,1",
                 manufacturer = "Apple",
                 brand = "Apple",
@@ -113,6 +162,7 @@ data class GameConfig(
                 vendor = "NVIDIA Corporation",
                 renderer = "NVIDIA Tegra",
                 version = "OpenGL ES 3.2 NVIDIA 418.00 (GLTools)",
+                extensions = EXT_NVIDIA_TEGRA,
                 model = "SHIELD Android TV",
                 manufacturer = "NVIDIA",
                 brand = "NVIDIA",
