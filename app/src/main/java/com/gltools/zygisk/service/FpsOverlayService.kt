@@ -22,6 +22,7 @@ import android.view.WindowManager
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.gltools.zygisk.R
+import java.io.File
 
 class FpsOverlayService : Service(), Choreographer.FrameCallback {
 
@@ -43,7 +44,8 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        fgMultiplier = intent?.getIntExtra("FG_MULTIPLIER", 1) ?: 1
+        val extraMult = intent?.getIntExtra("FG_MULTIPLIER", 1) ?: 1
+        if (extraMult > 1) fgMultiplier = extraMult
         return START_STICKY
     }
 
@@ -145,11 +147,29 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
         val tempTenths = batteryIntent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
         val tempCelsius = tempTenths / 10.0
 
-        if (fgMultiplier > 1) {
-            val fgFps = currentFps * fgMultiplier
-            tvMetrics.text = String.format("%d FPS [FG %dx] | %.1f°C", fgFps, fgMultiplier, tempCelsius)
+        var displayFps = currentFps * fgMultiplier
+        var activeMult = fgMultiplier
+
+        // Check real-time in-game eglSwapBuffers telemetry written by the Zygisk hook
+        try {
+            val liveFile = File("/data/local/tmp/gltools/live_fps")
+            if (liveFile.exists() && System.currentTimeMillis() - liveFile.lastModified() < 3000) {
+                val parts = liveFile.readText().trim().split(" ")
+                if (parts.size >= 3) {
+                    val effFps = parts[1].toIntOrNull()
+                    val mult = parts[2].toIntOrNull()
+                    if (effFps != null && effFps > 0 && mult != null) {
+                        displayFps = effFps
+                        activeMult = mult
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        if (activeMult > 1) {
+            tvMetrics.text = String.format("%d FPS [FG %dx] | %.1f°C", displayFps, activeMult, tempCelsius)
         } else {
-            tvMetrics.text = String.format("%d FPS | %.1f°C", currentFps, tempCelsius)
+            tvMetrics.text = String.format("%d FPS | %.1f°C", displayFps, tempCelsius)
         }
     }
 
