@@ -24,6 +24,7 @@ object RootConfigManager {
 
     fun saveConfig(config: GameConfig): Boolean {
         val cleanCustomGlsl = config.customGlsl.replace("\n", " ").replace("\r", " ").trim()
+        val cleanExtensions = config.extensions.replace("\n", " ").replace("\r", " ").trim()
         val confContent = buildString {
             appendLine("packageName=${config.packageName}")
             appendLine("enabled=${config.enabled}")
@@ -31,6 +32,8 @@ object RootConfigManager {
             appendLine("vendor=${config.vendor}")
             appendLine("renderer=${config.renderer}")
             appendLine("version=${config.version}")
+            appendLine("extensionsPreset=${config.extensionsPreset}")
+            appendLine("extensions=$cleanExtensions")
             appendLine("model=${config.model}")
             appendLine("manufacturer=${config.manufacturer}")
             appendLine("brand=${config.brand}")
@@ -53,6 +56,8 @@ object RootConfigManager {
             put("vendor", config.vendor)
             put("renderer", config.renderer)
             put("version", config.version)
+            put("extensionsPreset", config.extensionsPreset)
+            put("extensions", cleanExtensions)
             put("model", config.model)
             put("manufacturer", config.manufacturer)
             put("brand", config.brand)
@@ -136,6 +141,8 @@ EOF_JSON
                     vendor = json.optString("vendor", config.vendor),
                     renderer = json.optString("renderer", config.renderer),
                     version = json.optString("version", config.version),
+                    extensionsPreset = json.optString("extensionsPreset", config.extensionsPreset),
+                    extensions = json.optString("extensions", config.extensions),
                     model = json.optString("model", config.model),
                     manufacturer = json.optString("manufacturer", config.manufacturer),
                     brand = json.optString("brand", config.brand),
@@ -169,6 +176,8 @@ EOF_JSON
                     "vendor" -> if (value.isNotEmpty()) config.vendor = value
                     "renderer" -> if (value.isNotEmpty()) config.renderer = value
                     "version" -> if (value.isNotEmpty()) config.version = value
+                    "extensionsPreset" -> if (value.isNotEmpty()) config.extensionsPreset = value
+                    "extensions" -> config.extensions = value
                     "model" -> if (value.isNotEmpty()) config.model = value
                     "manufacturer" -> if (value.isNotEmpty()) config.manufacturer = value
                     "brand" -> if (value.isNotEmpty()) config.brand = value
