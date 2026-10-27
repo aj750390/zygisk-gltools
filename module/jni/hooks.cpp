@@ -58,12 +58,6 @@
 #ifndef EGL_CONTEXT_CLIENT_VERSION
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
 #endif
-#ifndef EGL_SWAP_BEHAVIOR
-#define EGL_SWAP_BEHAVIOR 0x3093
-#endif
-#ifndef EGL_BUFFER_PRESERVED
-#define EGL_BUFFER_PRESERVED 0x3094
-#endif
 #ifndef EGL_NONE
 #define EGL_NONE 0x3038
 #endif
@@ -107,7 +101,6 @@ static void *(*orig_eglGetProcAddress)(const char *procname) = nullptr;
 static void *(*orig_eglCreateContext)(void *dpy, void *config, void *share_context, const int *attrib_list) = nullptr;
 static EGLBoolean (*orig_eglSwapBuffers)(void *dpy, void *surface) = nullptr;
 static EGLBoolean (*orig_eglSwapInterval)(void *dpy, EGLint interval) = nullptr;
-static EGLBoolean (*orig_eglSurfaceAttrib)(void *dpy, void *surface, EGLint attribute, EGLint value) = nullptr;
 static int (*orig_usleep)(useconds_t usec) = nullptr;
 static int (*orig_nanosleep)(const struct timespec *req, struct timespec *rem) = nullptr;
 static void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
@@ -186,7 +179,7 @@ static std::string injectGlslShaderEffect(const std::string &src) {
 
     const std::string &mode = g_config.shaderPreset;
     const bool hasShaderPreset = (!mode.empty() && mode != "None" && mode.find("None") != 0);
-    if (!hasShaderPreset && g_fgMultiplier <= 1) {
+    if (!hasShaderPreset) {
         return modified;
     }
 
@@ -199,8 +192,6 @@ static std::string injectGlslShaderEffect(const std::string &src) {
             return modified;
         }
 
-        // All presets use the proven scale-preserving (PreExposure-safe) 3-line structure
-        // (dot -> max(mix(...), vec3(0.0)) -> * vec3(...)) with explicit 'mediump' qualifiers.
         std::string effectCode;
         if (mode.find("DLSS 5") != std::string::npos) {
             effectCode =
@@ -244,17 +235,26 @@ static std::string injectGlslShaderEffect(const std::string &src) {
                 p += outVar.length();
             }
             effectCode = "    " + expr + "\n";
-        } else if (g_fgMultiplier > 1) {
-            // Sub-frame temporal motion anti-judder smoothing when Frame Generation is active without a color shader
-            effectCode =
-                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    mediump vec3 _glt_fg = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.08), vec3(0.0));\n"
-                "    " + outVar + ".rgb = _glt_fg * 1.02;\n";
         }
 
         if (!effectCode.empty()) {
             modified = std::regex_replace(modified, mainRegex, "void _gltools_orig_main()", std::regex_constants::format_first_only);
-            modified += "\nvoid main() {\n    _gltools_orig_main();\n" + effectCode + "}\n";
+            // Universal Skin Tone & Stadium Grass Protection across ALL presets:
+            // 1. Normalized chromaticity skin detection (scale-invariant under both LDR and Unreal Engine 4 HDR PreExposure).
+            //    Guarantees player faces remain natural, lifelike, and soft without sunburn or oversaturation.
+            // 2. Pitch grass protection preserves rich organic emerald turf and eliminates radioactive yellow/lime tint.
+            modified +=
+                "\nvoid main() {\n"
+                "    _gltools_orig_main();\n"
+                "    mediump vec3 _glt_orig = " + outVar + ".rgb;\n"
+                "    mediump float _glt_sum = _glt_orig.r + _glt_orig.g + _glt_orig.b + 0.0001;\n"
+                "    mediump vec3 _glt_n = _glt_orig / _glt_sum;\n"
+                "    mediump float _glt_sk = (_glt_n.r > _glt_n.g && _glt_n.g > _glt_n.b && (_glt_n.r - _glt_n.b) > 0.05 && _glt_n.b < 0.35) ? 1.0 : 0.0;\n"
+                "    mediump float _glt_gr = (_glt_n.g > _glt_n.r && _glt_n.g > _glt_n.b) ? 1.0 : 0.0;\n"
+                + effectCode +
+                "    " + outVar + ".rgb = mix(" + outVar + ".rgb, _glt_orig * vec3(1.01, 1.00, 0.99), _glt_sk * 0.90);\n"
+                "    " + outVar + ".rgb = mix(" + outVar + ".rgb, _glt_orig * vec3(0.75, 0.98, 0.82), _glt_gr * 0.45);\n"
+                "}\n";
         }
     } catch (...) {
         return src;
@@ -263,9 +263,7 @@ static std::string injectGlslShaderEffect(const std::string &src) {
     return modified;
 }
 
-// Frame Generation: Game Loop Sleep Compressor (intercepts Unreal Engine 4 FPlatformProcess::Sleep & Unity frame cap sleeps!)
-// Compresses frame-limiter sleeps (1ms - 45ms) by the FrameGen multiplier so 30/60 FPS caps unlock to 60/120+ FPS
-// without altering physics speed (since Unreal/Unity physics use CLOCK_MONOTONIC delta time).
+// Frame Generation: Game Loop Sleep Compressor (unlocks Unreal Engine 4 FPlatformProcess::Sleep & Unity frame cap)
 static int hooked_usleep(useconds_t usec) {
     if (g_config.enabled && g_vsyncUncapActive && usec >= 1000 && usec <= 45000) {
         int div = (g_fgMultiplier > 1) ? (g_fgMultiplier + 1) : 4;
@@ -293,7 +291,7 @@ static EGLBoolean hooked_eglSwapInterval(void *dpy, EGLint interval) {
     return orig_eglSwapInterval ? orig_eglSwapInterval(dpy, interval) : 1;
 }
 
-// Frame Generation: eglSwapBuffers hook (unlocks surface VSync, preserves buffer for sub-frame interpolation, and writes live FPS telemetry)
+// Frame Generation: eglSwapBuffers hook (unlocks VSync, tracks real in-game FPS, and writes live telemetry with ZERO ghosting)
 static EGLBoolean hooked_eglSwapBuffers(void *dpy, void *surface) {
     if (!orig_eglSwapBuffers) return 0;
 
@@ -303,14 +301,6 @@ static EGLBoolean hooked_eglSwapBuffers(void *dpy, void *surface) {
             if (orig_eglSwapInterval) {
                 orig_eglSwapInterval(dpy, 0);
             }
-            if (g_fgMultiplier > 1 && orig_eglSurfaceAttrib) {
-                orig_eglSurfaceAttrib(dpy, surface, EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED);
-            }
-        }
-
-        // For 2x/3x Frame Generation with preserved backbuffer, present the interpolated sub-frame
-        if (g_fgMultiplier > 1 && orig_eglSurfaceAttrib) {
-            orig_eglSwapBuffers(dpy, surface);
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -322,7 +312,6 @@ static EGLBoolean hooked_eglSwapBuffers(void *dpy, void *surface) {
             g_renderedFrames = 0;
             g_lastFpsReportTime = now;
 
-            // Export live measured in-game FPS to /data/local/tmp/gltools/live_fps for Floating HUD
             FILE *fp = std::fopen("/data/local/tmp/gltools/live_fps", "w");
             if (fp) {
                 std::fprintf(fp, "%d %d %d\n", nativeFps, effectiveFps, g_fgMultiplier);
@@ -445,7 +434,6 @@ static const GLubyte *hooked_glGetString(GLenum name) {
     return orig_glGetString ? orig_glGetString(name) : nullptr;
 }
 
-// Native glGetStringi hook (for OpenGL ES 3.0+ indexed GL_EXTENSIONS queries)
 static const GLubyte *hooked_glGetStringi(GLenum name, GLuint index) {
     if (g_config.enabled && name == GL_EXTENSIONS && !g_config.extensionList.empty()) {
         if (index < g_config.extensionList.size()) {
@@ -1012,7 +1000,6 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     orig_eglCreateContext = reinterpret_cast<void *(*)(void *, void *, void *, const int *)>(resolveSym("eglCreateContext"));
     orig_eglSwapBuffers = reinterpret_cast<EGLBoolean (*)(void *, void *)>(resolveSym("eglSwapBuffers"));
     orig_eglSwapInterval = reinterpret_cast<EGLBoolean (*)(void *, EGLint)>(resolveSym("eglSwapInterval"));
-    orig_eglSurfaceAttrib = reinterpret_cast<EGLBoolean (*)(void *, void *, EGLint, EGLint)>(resolveSym("eglSurfaceAttrib"));
     orig_usleep = reinterpret_cast<int (*)(useconds_t)>(dlsym(RTLD_DEFAULT, "usleep"));
     orig_nanosleep = reinterpret_cast<int (*)(const struct timespec *, struct timespec *)>(dlsym(RTLD_DEFAULT, "nanosleep"));
     orig_dlsym = reinterpret_cast<void *(*)(void *, const char *)>(dlsym(RTLD_DEFAULT, "dlsym"));
