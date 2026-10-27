@@ -54,6 +54,18 @@
                 android:textColor="#64B5F6"
                 android:textSize="11sp"
                 android:fontFamily="monospace" />
+
+            <TextView
+                android:id="@+id/tvGlExtensionsColumn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:text="GL_EXTENSIONS: Native GPU Extensions"
+                android:textColor="#80DEEA"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
         </LinearLayout>
 
         <androidx.appcompat.widget.SwitchCompat
