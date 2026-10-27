@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
 #include <jni.h>
@@ -15,6 +16,7 @@ struct GlToolsConfig {
     std::string renderer = "Adreno (TM) 750";
     std::string version = "OpenGL ES 3.2 V@0615.0 (GLTools)";
     std::string extensions = "";
+    std::vector<std::string> extensionList;
     int targetGlMajor = 3;
     int targetGlMinor = 2;
 

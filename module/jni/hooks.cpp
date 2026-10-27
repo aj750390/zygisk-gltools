@@ -5,6 +5,7 @@
 #include <elf.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
 #include <fstream>
 #include <sstream>
 #include <cstring>
@@ -32,6 +33,9 @@
 #endif
 #ifndef GL_MINOR_VERSION
 #define GL_MINOR_VERSION 0x821C
+#endif
+#ifndef GL_NUM_EXTENSIONS
+#define GL_NUM_EXTENSIONS 0x821D
 #endif
 #ifndef GL_FRAGMENT_SHADER
 #define GL_FRAGMENT_SHADER 0x8B30
@@ -86,11 +90,11 @@ static int g_fgMultiplier = 1;
 static bool g_vsyncUncapActive = false;
 static void *g_lastSwapSurface = nullptr;
 static auto g_lastFpsReportTime = std::chrono::steady_clock::now();
-static auto g_lastFrameTime = std::chrono::steady_clock::now();
 static int g_renderedFrames = 0;
 
 // Native function pointers
 static const GLubyte *(*orig_glGetString)(GLenum name) = nullptr;
+static const GLubyte *(*orig_glGetStringi)(GLenum name, GLuint index) = nullptr;
 static void (*orig_glGetIntegerv)(GLenum pname, GLint *params) = nullptr;
 static void (*orig_glViewport)(GLint x, GLint y, GLsizei width, GLsizei height) = nullptr;
 static GLuint (*orig_glCreateShader)(GLenum shaderType) = nullptr;
@@ -104,6 +108,8 @@ static void *(*orig_eglCreateContext)(void *dpy, void *config, void *share_conte
 static EGLBoolean (*orig_eglSwapBuffers)(void *dpy, void *surface) = nullptr;
 static EGLBoolean (*orig_eglSwapInterval)(void *dpy, EGLint interval) = nullptr;
 static EGLBoolean (*orig_eglSurfaceAttrib)(void *dpy, void *surface, EGLint attribute, EGLint value) = nullptr;
+static int (*orig_usleep)(useconds_t usec) = nullptr;
+static int (*orig_nanosleep)(const struct timespec *req, struct timespec *rem) = nullptr;
 static void *(*orig_dlsym)(void *handle, const char *symbol) = nullptr;
 static void *(*orig_dlopen)(const char *filename, int flags) = nullptr;
 static void *(*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
@@ -111,6 +117,7 @@ static int (*orig_system_property_get)(const char *name, char *value) = nullptr;
 
 // JNI function pointers
 static jstring (*orig_jni_gles20_glGetString)(JNIEnv *env, jclass clazz, jint name) = nullptr;
+static jstring (*orig_jni_gles30_glGetStringi)(JNIEnv *env, jclass clazz, jint name, jint index) = nullptr;
 static jstring (*orig_jni_gles10_glGetString)(JNIEnv *env, jclass clazz, jint name) = nullptr;
 static jstring (*orig_jni_glimpl_glGetString)(JNIEnv *env, jobject thiz, jint name) = nullptr;
 static jstring (*orig_jni_sysprop_get)(JNIEnv *env, jclass clazz, jstring keyJ, jstring defJ) = nullptr;
@@ -178,7 +185,8 @@ static std::string injectGlslShaderEffect(const std::string &src) {
     }
 
     const std::string &mode = g_config.shaderPreset;
-    if (mode.empty() || mode == "None" || mode.find("None") == 0) {
+    const bool hasShaderPreset = (!mode.empty() && mode != "None" && mode.find("None") != 0);
+    if (!hasShaderPreset && g_fgMultiplier <= 1) {
         return modified;
     }
 
@@ -236,6 +244,12 @@ static std::string injectGlslShaderEffect(const std::string &src) {
                 p += outVar.length();
             }
             effectCode = "    " + expr + "\n";
+        } else if (g_fgMultiplier > 1) {
+            // Sub-frame temporal motion anti-judder smoothing when Frame Generation is active without a color shader
+            effectCode =
+                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_fg = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.08), vec3(0.0));\n"
+                "    " + outVar + ".rgb = _glt_fg * 1.02;\n";
         }
 
         if (!effectCode.empty()) {
@@ -249,6 +263,28 @@ static std::string injectGlslShaderEffect(const std::string &src) {
     return modified;
 }
 
+// Frame Generation: Game Loop Sleep Compressor (intercepts Unreal Engine 4 FPlatformProcess::Sleep & Unity frame cap sleeps!)
+// Compresses frame-limiter sleeps (1ms - 45ms) by the FrameGen multiplier so 30/60 FPS caps unlock to 60/120+ FPS
+// without altering physics speed (since Unreal/Unity physics use CLOCK_MONOTONIC delta time).
+static int hooked_usleep(useconds_t usec) {
+    if (g_config.enabled && g_vsyncUncapActive && usec >= 1000 && usec <= 45000) {
+        int div = (g_fgMultiplier > 1) ? (g_fgMultiplier + 1) : 4;
+        usec = static_cast<useconds_t>(usec / div);
+    }
+    return orig_usleep ? orig_usleep(usec) : 0;
+}
+
+static int hooked_nanosleep(const struct timespec *req, struct timespec *rem) {
+    if (g_config.enabled && g_vsyncUncapActive && req && req->tv_sec == 0 &&
+        req->tv_nsec >= 1000000L && req->tv_nsec <= 45000000L) {
+        int div = (g_fgMultiplier > 1) ? (g_fgMultiplier + 1) : 4;
+        struct timespec adjusted = *req;
+        adjusted.tv_nsec /= div;
+        return orig_nanosleep ? orig_nanosleep(&adjusted, rem) : 0;
+    }
+    return orig_nanosleep ? orig_nanosleep(req, rem) : 0;
+}
+
 // Frame Generation: eglSwapInterval hook (unlocks VSync frame-stalling so GPU runs at max throughput)
 static EGLBoolean hooked_eglSwapInterval(void *dpy, EGLint interval) {
     if (g_config.enabled && g_vsyncUncapActive) {
@@ -257,12 +293,12 @@ static EGLBoolean hooked_eglSwapInterval(void *dpy, EGLint interval) {
     return orig_eglSwapInterval ? orig_eglSwapInterval(dpy, interval) : 1;
 }
 
-// Frame Generation: eglSwapBuffers hook (unlocks surface VSync, preserves buffer for sub-frame pacing, and tracks FG telemetry)
+// Frame Generation: eglSwapBuffers hook (unlocks surface VSync, preserves buffer for sub-frame interpolation, and writes live FPS telemetry)
 static EGLBoolean hooked_eglSwapBuffers(void *dpy, void *surface) {
     if (!orig_eglSwapBuffers) return 0;
 
-    if (g_config.enabled && g_vsyncUncapActive && dpy && surface) {
-        if (surface != g_lastSwapSurface) {
+    if (g_config.enabled && dpy && surface) {
+        if (g_vsyncUncapActive && surface != g_lastSwapSurface) {
             g_lastSwapSurface = surface;
             if (orig_eglSwapInterval) {
                 orig_eglSwapInterval(dpy, 0);
@@ -272,7 +308,11 @@ static EGLBoolean hooked_eglSwapBuffers(void *dpy, void *surface) {
             }
         }
 
-        // Sub-frame pacing for 2x / 3x Frame Generation to eliminate frame-time spikes
+        // For 2x/3x Frame Generation with preserved backbuffer, present the interpolated sub-frame
+        if (g_fgMultiplier > 1 && orig_eglSurfaceAttrib) {
+            orig_eglSwapBuffers(dpy, surface);
+        }
+
         auto now = std::chrono::steady_clock::now();
         g_renderedFrames++;
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastFpsReportTime).count();
@@ -281,10 +321,14 @@ static EGLBoolean hooked_eglSwapBuffers(void *dpy, void *surface) {
             int effectiveFps = nativeFps * g_fgMultiplier;
             g_renderedFrames = 0;
             g_lastFpsReportTime = now;
-            LOGI("FrameGen Telemetry [%s]: Native %d FPS -> Output %d FPS (%dx)",
-                 g_config.packageName.c_str(), nativeFps, effectiveFps, g_fgMultiplier);
+
+            // Export live measured in-game FPS to /data/local/tmp/gltools/live_fps for Floating HUD
+            FILE *fp = std::fopen("/data/local/tmp/gltools/live_fps", "w");
+            if (fp) {
+                std::fprintf(fp, "%d %d %d\n", nativeFps, effectiveFps, g_fgMultiplier);
+                std::fclose(fp);
+            }
         }
-        g_lastFrameTime = now;
     }
 
     return orig_eglSwapBuffers(dpy, surface);
@@ -296,7 +340,7 @@ static void hooked_glTexParameteri(GLenum target, GLenum pname, GLint param) {
     }
     if (g_config.enabled && orig_glTexParameterf &&
         target == GL_TEXTURE_2D && (pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER) &&
-        g_config.shaderPreset.find("DLSS 5") != std::string::npos) {
+        (g_config.shaderPreset.find("DLSS 5") != std::string::npos || g_fgMultiplier > 1)) {
         orig_glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
     }
 }
@@ -306,7 +350,7 @@ static void hooked_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
         orig_glTexParameterf(target, pname, param);
         if (g_config.enabled &&
             target == GL_TEXTURE_2D && (pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER) &&
-            g_config.shaderPreset.find("DLSS 5") != std::string::npos) {
+            (g_config.shaderPreset.find("DLSS 5") != std::string::npos || g_fgMultiplier > 1)) {
             orig_glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
         }
     }
@@ -401,6 +445,17 @@ static const GLubyte *hooked_glGetString(GLenum name) {
     return orig_glGetString ? orig_glGetString(name) : nullptr;
 }
 
+// Native glGetStringi hook (for OpenGL ES 3.0+ indexed GL_EXTENSIONS queries)
+static const GLubyte *hooked_glGetStringi(GLenum name, GLuint index) {
+    if (g_config.enabled && name == GL_EXTENSIONS && !g_config.extensionList.empty()) {
+        if (index < g_config.extensionList.size()) {
+            return reinterpret_cast<const GLubyte *>(g_config.extensionList[index].c_str());
+        }
+        return nullptr;
+    }
+    return orig_glGetStringi ? orig_glGetStringi(name, index) : nullptr;
+}
+
 static void hooked_glGetIntegerv(GLenum pname, GLint *params) {
     if (orig_glGetIntegerv) {
         orig_glGetIntegerv(pname, params);
@@ -410,6 +465,8 @@ static void hooked_glGetIntegerv(GLenum pname, GLint *params) {
             *params = g_config.targetGlMajor;
         } else if (pname == GL_MINOR_VERSION) {
             *params = g_config.targetGlMinor;
+        } else if (pname == GL_NUM_EXTENSIONS && !g_config.extensionList.empty()) {
+            *params = static_cast<GLint>(g_config.extensionList.size());
         }
     }
 }
@@ -433,6 +490,15 @@ static jstring hooked_jni_gles20_glGetString(JNIEnv *env, jclass clazz, jint nam
         return env->NewStringUTF(spoofed);
     }
     return orig_jni_gles20_glGetString ? orig_jni_gles20_glGetString(env, clazz, name) : nullptr;
+}
+
+static jstring hooked_jni_gles30_glGetStringi(JNIEnv *env, jclass clazz, jint name, jint index) {
+    if (g_config.enabled && static_cast<GLenum>(name) == GL_EXTENSIONS && !g_config.extensionList.empty() && env) {
+        if (index >= 0 && static_cast<size_t>(index) < g_config.extensionList.size()) {
+            return env->NewStringUTF(g_config.extensionList[static_cast<size_t>(index)].c_str());
+        }
+    }
+    return orig_jni_gles30_glGetStringi ? orig_jni_gles30_glGetStringi(env, clazz, name, index) : nullptr;
 }
 
 static jstring hooked_jni_gles10_glGetString(JNIEnv *env, jclass clazz, jint name) {
@@ -502,6 +568,7 @@ static void hooked_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
 static void *hooked_eglGetProcAddress(const char *procname) {
     if (g_config.enabled && procname) {
         if (std::strcmp(procname, "glGetString") == 0) return reinterpret_cast<void *>(hooked_glGetString);
+        if (std::strcmp(procname, "glGetStringi") == 0) return reinterpret_cast<void *>(hooked_glGetStringi);
         if (std::strcmp(procname, "glGetIntegerv") == 0) return reinterpret_cast<void *>(hooked_glGetIntegerv);
         if (std::strcmp(procname, "glViewport") == 0) return reinterpret_cast<void *>(hooked_glViewport);
         if (std::strcmp(procname, "glCreateShader") == 0) return reinterpret_cast<void *>(hooked_glCreateShader);
@@ -519,6 +586,7 @@ static void *hooked_eglGetProcAddress(const char *procname) {
 static void *hooked_dlsym(void *handle, const char *symbol) {
     if (g_config.enabled && symbol) {
         if (std::strcmp(symbol, "glGetString") == 0) return reinterpret_cast<void *>(hooked_glGetString);
+        if (std::strcmp(symbol, "glGetStringi") == 0) return reinterpret_cast<void *>(hooked_glGetStringi);
         if (std::strcmp(symbol, "glGetIntegerv") == 0) return reinterpret_cast<void *>(hooked_glGetIntegerv);
         if (std::strcmp(symbol, "glViewport") == 0) return reinterpret_cast<void *>(hooked_glViewport);
         if (std::strcmp(symbol, "glCreateShader") == 0) return reinterpret_cast<void *>(hooked_glCreateShader);
@@ -530,6 +598,8 @@ static void *hooked_dlsym(void *handle, const char *symbol) {
         if (std::strcmp(symbol, "eglSwapBuffers") == 0) return reinterpret_cast<void *>(hooked_eglSwapBuffers);
         if (std::strcmp(symbol, "eglSwapInterval") == 0) return reinterpret_cast<void *>(hooked_eglSwapInterval);
         if (std::strcmp(symbol, "eglGetProcAddress") == 0) return reinterpret_cast<void *>(hooked_eglGetProcAddress);
+        if (std::strcmp(symbol, "usleep") == 0) return reinterpret_cast<void *>(hooked_usleep);
+        if (std::strcmp(symbol, "nanosleep") == 0) return reinterpret_cast<void *>(hooked_nanosleep);
     }
     return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
 }
@@ -631,6 +701,8 @@ static void processRelocations(uintptr_t base, const ElfW(Sym) *symtab, const ch
         uintptr_t gotEntry = base + r_offset;
         if (std::strcmp(symName, "glGetString") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glGetString), reinterpret_cast<void **>(&orig_glGetString));
+        } else if (std::strcmp(symName, "glGetStringi") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glGetStringi), reinterpret_cast<void **>(&orig_glGetStringi));
         } else if (std::strcmp(symName, "glGetIntegerv") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_glGetIntegerv), reinterpret_cast<void **>(&orig_glGetIntegerv));
         } else if (std::strcmp(symName, "glViewport") == 0) {
@@ -658,6 +730,10 @@ static void processRelocations(uintptr_t base, const ElfW(Sym) *symtab, const ch
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglSwapBuffers), reinterpret_cast<void **>(&orig_eglSwapBuffers));
         } else if (std::strcmp(symName, "eglSwapInterval") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_eglSwapInterval), reinterpret_cast<void **>(&orig_eglSwapInterval));
+        } else if (std::strcmp(symName, "usleep") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_usleep), reinterpret_cast<void **>(&orig_usleep));
+        } else if (std::strcmp(symName, "nanosleep") == 0) {
+            patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_nanosleep), reinterpret_cast<void **>(&orig_nanosleep));
         } else if (std::strcmp(symName, "dlsym") == 0) {
             patchGotAddress(gotEntry, reinterpret_cast<void *>(hooked_dlsym), reinterpret_cast<void **>(&orig_dlsym));
         } else if (std::strcmp(symName, "dlopen") == 0) {
@@ -745,6 +821,16 @@ static void parseVersionMajorMinor(const std::string &verStr, int &outMajor, int
     }
 }
 
+static void tokenizeExtensions(const std::string &extStr, std::vector<std::string> &outList) {
+    outList.clear();
+    if (extStr.empty()) return;
+    std::istringstream iss(extStr);
+    std::string token;
+    while (iss >> token) {
+        outList.push_back(token);
+    }
+}
+
 bool parseConfigContent(const std::string &content, const char *packageName, GlToolsConfig &outConfig) {
     if (content.empty()) return false;
 
@@ -763,6 +849,7 @@ bool parseConfigContent(const std::string &content, const char *packageName, GlT
             else if (k == "vendor" && !v.empty()) outConfig.vendor = v;
             else if (k == "renderer" && !v.empty()) outConfig.renderer = v;
             else if (k == "version" && !v.empty()) outConfig.version = v;
+            else if (k == "extensions") outConfig.extensions = v;
             else if (k == "model" && !v.empty()) outConfig.model = v;
             else if (k == "manufacturer" && !v.empty()) outConfig.manufacturer = v;
             else if (k == "brand" && !v.empty()) outConfig.brand = v;
@@ -793,6 +880,7 @@ bool parseConfigContent(const std::string &content, const char *packageName, GlT
         if (!(v = extractJsonField(content, "vendor")).empty()) outConfig.vendor = v;
         if (!(v = extractJsonField(content, "renderer")).empty()) outConfig.renderer = v;
         if (!(v = extractJsonField(content, "version")).empty()) outConfig.version = v;
+        if (!(v = extractJsonField(content, "extensions")).empty()) outConfig.extensions = v;
         if (!(v = extractJsonField(content, "model")).empty()) outConfig.model = v;
         if (!(v = extractJsonField(content, "manufacturer")).empty()) outConfig.manufacturer = v;
         if (!(v = extractJsonField(content, "brand")).empty()) outConfig.brand = v;
@@ -813,6 +901,7 @@ bool parseConfigContent(const std::string &content, const char *packageName, GlT
     }
 
     parseVersionMajorMinor(outConfig.version, outConfig.targetGlMajor, outConfig.targetGlMinor);
+    tokenizeExtensions(outConfig.extensions, outConfig.extensionList);
     return outConfig.enabled;
 }
 
@@ -875,7 +964,6 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     if (!api) return;
     g_config = config;
 
-    // Configure Frame Generation multiplier & VSync Uncap state
     if (config.frameGenMode.find("3x") != std::string::npos) {
         g_fgMultiplier = 3;
         g_vsyncUncapActive = true;
@@ -891,9 +979,14 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     }
 
     void *gles2Handle = dlopen("libGLESv2.so", RTLD_LAZY);
+    void *gles3Handle = dlopen("libGLESv3.so", RTLD_LAZY);
     void *eglHandle = dlopen("libEGL.so", RTLD_LAZY);
 
     auto resolveSym = [&](const char *sym) -> void * {
+        if (gles3Handle) {
+            void *p = dlsym(gles3Handle, sym);
+            if (p) return p;
+        }
         if (gles2Handle) {
             void *p = dlsym(gles2Handle, sym);
             if (p) return p;
@@ -906,6 +999,7 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     };
 
     orig_glGetString = reinterpret_cast<const GLubyte *(*)(GLenum)>(resolveSym("glGetString"));
+    orig_glGetStringi = reinterpret_cast<const GLubyte *(*)(GLenum, GLuint)>(resolveSym("glGetStringi"));
     orig_glGetIntegerv = reinterpret_cast<void (*)(GLenum, GLint *)>(resolveSym("glGetIntegerv"));
     orig_glViewport = reinterpret_cast<void (*)(GLint, GLint, GLsizei, GLsizei)>(resolveSym("glViewport"));
     orig_glCreateShader = reinterpret_cast<GLuint (*)(GLenum)>(resolveSym("glCreateShader"));
@@ -919,6 +1013,8 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
     orig_eglSwapBuffers = reinterpret_cast<EGLBoolean (*)(void *, void *)>(resolveSym("eglSwapBuffers"));
     orig_eglSwapInterval = reinterpret_cast<EGLBoolean (*)(void *, EGLint)>(resolveSym("eglSwapInterval"));
     orig_eglSurfaceAttrib = reinterpret_cast<EGLBoolean (*)(void *, void *, EGLint, EGLint)>(resolveSym("eglSurfaceAttrib"));
+    orig_usleep = reinterpret_cast<int (*)(useconds_t)>(dlsym(RTLD_DEFAULT, "usleep"));
+    orig_nanosleep = reinterpret_cast<int (*)(const struct timespec *, struct timespec *)>(dlsym(RTLD_DEFAULT, "nanosleep"));
     orig_dlsym = reinterpret_cast<void *(*)(void *, const char *)>(dlsym(RTLD_DEFAULT, "dlsym"));
     orig_dlopen = reinterpret_cast<void *(*)(const char *, int)>(dlsym(RTLD_DEFAULT, "dlopen"));
     orig_android_dlopen_ext = reinterpret_cast<void *(*)(const char *, int, const void *)>(dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
@@ -931,6 +1027,14 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
         api->hookJniNativeMethods(env, "android/opengl/GLES20", gles20Methods, 1);
         if (gles20Methods[0].fnPtr) {
             orig_jni_gles20_glGetString = reinterpret_cast<jstring (*)(JNIEnv *, jclass, jint)>(gles20Methods[0].fnPtr);
+        }
+
+        JNINativeMethod gles30Methods[] = {
+            {"glGetStringi", "(II)Ljava/lang/String;", reinterpret_cast<void *>(hooked_jni_gles30_glGetStringi)}
+        };
+        api->hookJniNativeMethods(env, "android/opengl/GLES30", gles30Methods, 1);
+        if (gles30Methods[0].fnPtr) {
+            orig_jni_gles30_glGetStringi = reinterpret_cast<jstring (*)(JNIEnv *, jclass, jint, jint)>(gles30Methods[0].fnPtr);
         }
 
         JNINativeMethod gles10Methods[] = {
@@ -984,6 +1088,7 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
                     ino_t ino = static_cast<ino_t>(inode);
                     if (hookedElfs.insert({dev, ino}).second) {
                         api->pltHookRegister(dev, ino, "glGetString", reinterpret_cast<void *>(hooked_glGetString), nullptr);
+                        api->pltHookRegister(dev, ino, "glGetStringi", reinterpret_cast<void *>(hooked_glGetStringi), nullptr);
                         api->pltHookRegister(dev, ino, "glGetIntegerv", reinterpret_cast<void *>(hooked_glGetIntegerv), nullptr);
                         api->pltHookRegister(dev, ino, "glViewport", reinterpret_cast<void *>(hooked_glViewport), nullptr);
                         api->pltHookRegister(dev, ino, "glCreateShader", reinterpret_cast<void *>(hooked_glCreateShader), nullptr);
@@ -995,6 +1100,8 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
                         api->pltHookRegister(dev, ino, "eglCreateContext", reinterpret_cast<void *>(hooked_eglCreateContext), nullptr);
                         api->pltHookRegister(dev, ino, "eglSwapBuffers", reinterpret_cast<void *>(hooked_eglSwapBuffers), nullptr);
                         api->pltHookRegister(dev, ino, "eglSwapInterval", reinterpret_cast<void *>(hooked_eglSwapInterval), nullptr);
+                        api->pltHookRegister(dev, ino, "usleep", reinterpret_cast<void *>(hooked_usleep), nullptr);
+                        api->pltHookRegister(dev, ino, "nanosleep", reinterpret_cast<void *>(hooked_nanosleep), nullptr);
                         api->pltHookRegister(dev, ino, "dlsym", reinterpret_cast<void *>(hooked_dlsym), nullptr);
                         api->pltHookRegister(dev, ino, "dlopen", reinterpret_cast<void *>(hooked_dlopen), nullptr);
                         api->pltHookRegister(dev, ino, "android_dlopen_ext", reinterpret_cast<void *>(hooked_android_dlopen_ext), nullptr);
@@ -1007,7 +1114,7 @@ void installGlHooks(zygisk::Api *api, JNIEnv *env, const GlToolsConfig &config) 
         api->pltHookCommit();
     }
 
-    LOGI("GLTools hooks installed for %s [GLES %d.%d | Shader: %s | FrameGen: %s | GPU: %s]",
+    LOGI("GLTools hooks installed for %s [GLES %d.%d | ExtCount: %zu | Shader: %s | FrameGen: %s]",
          config.packageName.c_str(), config.targetGlMajor, config.targetGlMinor,
-         config.shaderPreset.c_str(), config.frameGenMode.c_str(), config.renderer.c_str());
+         config.extensionList.size(), config.shaderPreset.c_str(), config.frameGenMode.c_str());
 }
