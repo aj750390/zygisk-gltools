@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvLiveGlVersion: TextView
     private lateinit var tvLiveGlRenderer: TextView
     private lateinit var tvLiveGlVendorModel: TextView
+    private lateinit var tvLiveGlExtensions: TextView
 
     private val appList = mutableListOf<GameConfig>()
     private var adapter: AppListAdapter? = null
@@ -60,6 +61,7 @@ class MainActivity : AppCompatActivity() {
         tvLiveGlVersion = findViewById(R.id.tvLiveGlVersion)
         tvLiveGlRenderer = findViewById(R.id.tvLiveGlRenderer)
         tvLiveGlVendorModel = findViewById(R.id.tvLiveGlVendorModel)
+        tvLiveGlExtensions = findViewById(R.id.tvLiveGlExtensions)
 
         rvApps.layoutManager = LinearLayoutManager(this)
         adapter = AppListAdapter(appList) { config ->
@@ -113,12 +115,17 @@ class MainActivity : AppCompatActivity() {
                     val vendor = GLES20.glGetString(GLES20.GL_VENDOR)
                         ?: gl?.glGetString(GL10.GL_VENDOR)
                         ?: "Unknown"
+                    val extensions = GLES20.glGetString(GLES20.GL_EXTENSIONS)
+                        ?: gl?.glGetString(GL10.GL_EXTENSIONS)
+                        ?: ""
+                    val extCount = extensions.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.size
                     val model = Build.MODEL ?: "Unknown"
 
                     runOnUiThread {
                         tvLiveGlVersion.text = "OpenGL ES: $version"
                         tvLiveGlRenderer.text = "GPU Renderer: $renderer"
                         tvLiveGlVendorModel.text = "Vendor: $vendor | Model: $model"
+                        tvLiveGlExtensions.text = "GL_EXTENSIONS ($extCount): $extensions"
 
                         val hooked = version.contains("GLTools", ignoreCase = true) || isSelfTestActive
                         if (hooked) {
@@ -154,6 +161,8 @@ class MainActivity : AppCompatActivity() {
                 vendor = "Qualcomm",
                 renderer = "Adreno (TM) 750",
                 version = "OpenGL ES 3.2 V@0615.0 (GLTools-Active)",
+                extensionsPreset = "Adreno 750 Flagship Extensions",
+                extensions = GameConfig.EXT_ADRENO_750,
                 model = "SM-S928B",
                 manufacturer = "samsung",
                 brand = "samsung",
@@ -261,6 +270,7 @@ class MainActivity : AppCompatActivity() {
             val tvName: TextView = view.findViewById(R.id.tvName)
             val tvPackage: TextView = view.findViewById(R.id.tvPackage)
             val tvGlVersionColumn: TextView = view.findViewById(R.id.tvGlVersionColumn)
+            val tvGlExtensionsColumn: TextView = view.findViewById(R.id.tvGlExtensionsColumn)
             val switchEnable: SwitchCompat = view.findViewById(R.id.switchEnable)
         }
 
@@ -278,11 +288,16 @@ class MainActivity : AppCompatActivity() {
                 val scalePct = (item.downscaleFactor * 100).toInt()
                 val shortShader = item.shaderPreset.substringBefore(" (")
                 val shortFg = item.frameGenMode.substringBefore(" (")
-                holder.tvGlVersionColumn.text = "ACTIVE | ${item.version} | Shader: $shortShader | FG: $shortFg | ${item.renderer} ($scalePct%)"
+                val extCount = item.extensions.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.size
+                holder.tvGlVersionColumn.text = "ACTIVE | ${item.version} | Shader: $shortShader | FG: $shortFg ($scalePct%)"
                 holder.tvGlVersionColumn.setTextColor(Color.parseColor("#00E676"))
+                holder.tvGlExtensionsColumn.text = "GL_EXTENSIONS ($extCount): ${item.extensionsPreset} [${item.extensions}]"
+                holder.tvGlExtensionsColumn.setTextColor(Color.parseColor("#80DEEA"))
             } else {
                 holder.tvGlVersionColumn.text = "GLES: Default Driver | Shader: None | FG: Off"
                 holder.tvGlVersionColumn.setTextColor(Color.parseColor("#78909C"))
+                holder.tvGlExtensionsColumn.text = "GL_EXTENSIONS: Native GPU Extensions"
+                holder.tvGlExtensionsColumn.setTextColor(Color.parseColor("#546E7A"))
             }
 
             try {

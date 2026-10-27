@@ -29,6 +29,8 @@ class AppDetailActivity : AppCompatActivity() {
     private lateinit var actvPreset: AutoCompleteTextView
     private lateinit var actvGlVersionPreset: AutoCompleteTextView
     private lateinit var etVersion: TextInputEditText
+    private lateinit var actvExtensionsPreset: AutoCompleteTextView
+    private lateinit var etExtensions: TextInputEditText
     private lateinit var etVendor: TextInputEditText
     private lateinit var etRenderer: TextInputEditText
     private lateinit var etModel: TextInputEditText
@@ -61,6 +63,8 @@ class AppDetailActivity : AppCompatActivity() {
         actvPreset = findViewById(R.id.actvPreset)
         actvGlVersionPreset = findViewById(R.id.actvGlVersionPreset)
         etVersion = findViewById(R.id.etVersion)
+        actvExtensionsPreset = findViewById(R.id.actvExtensionsPreset)
+        etExtensions = findViewById(R.id.etExtensions)
         etVendor = findViewById(R.id.etVendor)
         etRenderer = findViewById(R.id.etRenderer)
         etModel = findViewById(R.id.etModel)
@@ -93,6 +97,19 @@ class AppDetailActivity : AppCompatActivity() {
             switchActive.isChecked = true
         }
 
+        val extPresetKeys = GameConfig.GL_EXTENSIONS_PRESETS.keys.toList()
+        val extPresetAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, extPresetKeys)
+        actvExtensionsPreset.setAdapter(extPresetAdapter)
+
+        actvExtensionsPreset.setOnItemClickListener { _, _, position, _ ->
+            val extKey = extPresetKeys[position]
+            config.extensionsPreset = extKey
+            val extVal = GameConfig.GL_EXTENSIONS_PRESETS[extKey].orEmpty()
+            config.extensions = extVal
+            etExtensions.setText(extVal)
+            switchActive.isChecked = true
+        }
+
         val presetKeys = GameConfig.PRESETS.keys.toList()
         val presetAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, presetKeys)
         actvPreset.setAdapter(presetAdapter)
@@ -108,6 +125,7 @@ class AppDetailActivity : AppCompatActivity() {
                 config.vendor = preset.vendor
                 config.renderer = preset.renderer
                 config.version = preset.version
+                config.extensions = preset.extensions
                 config.model = preset.model
                 config.manufacturer = preset.manufacturer
                 config.brand = preset.brand
@@ -119,6 +137,7 @@ class AppDetailActivity : AppCompatActivity() {
                 etRenderer.setText(preset.renderer)
                 etVersion.setText(preset.version)
                 actvGlVersionPreset.setText(preset.version, false)
+                etExtensions.setText(preset.extensions)
                 etModel.setText(preset.model)
                 switchActive.isChecked = true
             }
@@ -154,6 +173,8 @@ class AppDetailActivity : AppCompatActivity() {
         actvPreset.setText(config.presetName, false)
         actvGlVersionPreset.setText(config.version, false)
         etVersion.setText(config.version)
+        actvExtensionsPreset.setText(config.extensionsPreset, false)
+        etExtensions.setText(config.extensions)
         etVendor.setText(config.vendor)
         etRenderer.setText(config.renderer)
         etModel.setText(config.model)
@@ -171,6 +192,8 @@ class AppDetailActivity : AppCompatActivity() {
         config.customGlsl = etCustomGlsl.text?.toString()?.trim().orEmpty()
         config.forceFp16Shaders = switchFp16Shaders.isChecked
         config.version = etVersion.text?.toString()?.trim().orEmpty().ifEmpty { "OpenGL ES 3.2 V@0615.0 (GLTools)" }
+        config.extensionsPreset = actvExtensionsPreset.text?.toString()?.trim().orEmpty().ifEmpty { "Adreno 750 Flagship Extensions" }
+        config.extensions = etExtensions.text?.toString()?.trim().orEmpty()
         config.vendor = etVendor.text?.toString()?.trim().orEmpty().ifEmpty { "Qualcomm" }
         config.renderer = etRenderer.text?.toString()?.trim().orEmpty().ifEmpty { "Adreno (TM) 750" }
         config.model = etModel.text?.toString()?.trim().orEmpty().ifEmpty { "SM-S928B" }
