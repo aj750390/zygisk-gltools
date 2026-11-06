@@ -1,6 +1,7 @@
 #include "hooks.h"
 
 #include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <link.h>
 #include <pthread.h>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -37,52 +39,102 @@
 #define MFD_CLOEXEC 0x0001U
 #endif
 
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
+
+#ifndef EGL_CONTEXT_MAJOR_VERSION_KHR
+#define EGL_CONTEXT_MAJOR_VERSION_KHR 0x3098
+#endif
+#ifndef EGL_CONTEXT_CLIENT_VERSION
+#define EGL_CONTEXT_CLIENT_VERSION 0x3098
+#endif
+#ifndef EGL_BAD_ATTRIBUTE
+#define EGL_BAD_ATTRIBUTE 0x3004
+#endif
+#ifndef EGL_NO_CONTEXT
+#define EGL_NO_CONTEXT ((EGLContext)0)
+#endif
+
+#if defined(__LP64__)
+typedef Elf64_Ehdr Elf_Ehdr;
+typedef Elf64_Phdr Elf_Phdr;
+typedef Elf64_Dyn  Elf_Dyn;
+typedef Elf64_Sym  Elf_Sym;
+typedef Elf64_Rela Elf_Rela;
+typedef Elf64_Rel  Elf_Rel;
+typedef Elf64_Addr Elf_Addr;
+#define ELF_R_SYM(i) ELF64_R_SYM(i)
+#else
+typedef Elf32_Ehdr Elf_Ehdr;
+typedef Elf32_Phdr Elf_Phdr;
+typedef Elf32_Dyn  Elf_Dyn;
+typedef Elf32_Sym  Elf_Sym;
+typedef Elf32_Rela Elf_Rela;
+typedef Elf32_Rel  Elf_Rel;
+typedef Elf32_Addr Elf_Addr;
+#define ELF_R_SYM(i) ELF32_R_SYM(i)
+#endif
+
 static GameConfig g_config;
 static std::string g_spoofedExtensionsStr;
 static std::vector<std::string> g_spoofedExtensionsList;
 static bool g_vsyncUncapActive = false;
+static std::mutex g_shaderMutex;
+static std::unordered_map<GLuint, GLenum> g_shaderTypes;
+
+static void refreshElfHooks();
 
 // ---------------------------------------------------------------------------
-// Helpers: File descriptor for fake CPU data
+// Helpers: Synthetic In-Memory File Descriptors for Fake CPU & Core Emulation
 // ---------------------------------------------------------------------------
 static std::string generateFakeCpuInfo() {
     std::string out;
     int cores = g_config.fakeCpuCores > 0 ? g_config.fakeCpuCores : 8;
-    std::string hardware = !g_config.fakeCpuHardware.empty() ? g_config.fakeCpuHardware : "Qualcomm Technologies, Inc SM8650";
+    std::string hardware = !g_config.fakeCpuHardware.empty()
+        ? g_config.fakeCpuHardware
+        : "Qualcomm Technologies, Inc SM8650";
+    std::string modelName = !g_config.fakeCpuName.empty()
+        ? g_config.fakeCpuName
+        : "Qualcomm Snapdragon 8 Gen 3";
 
     for (int i = 0; i < cores; ++i) {
-        out += "processor	: " + std::to_string(i) + "\n";
-        out += "BogoMIPS	: 38.40\n";
-        out += "Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint\n";
-        out += "CPU implementer	: 0x51\n";
+        out += "processor\t: " + std::to_string(i) + "\n";
+        out += "model name\t: " + modelName + "\n";
+        out += "BogoMIPS\t: 38.40\n";
+        out += "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint\n";
+        out += "CPU implementer\t: 0x51\n";
         out += "CPU architecture: 8\n";
-        out += "CPU variant	: 0x2\n";
-        out += "CPU part	: 0x001\n";
-        out += "CPU revision	: 1\n\n";
+        out += "CPU variant\t: 0x2\n";
+        out += "CPU part\t: 0x001\n";
+        out += "CPU revision\t: 1\n\n";
     }
-    out += "Hardware	: " + hardware + "\n";
-    out += "Revision	: 0000\n";
-    out += "Serial		: 0000000000000000\n";
+    out += "Hardware\t: " + hardware + "\n";
+    out += "Revision\t: 0000\n";
+    out += "Serial\t\t: 0000000000000000\n";
     return out;
 }
 
 static std::string generateCpuRange() {
     int cores = g_config.fakeCpuCores > 0 ? g_config.fakeCpuCores : 8;
+    if (cores == 1) return "0\n";
     return "0-" + std::to_string(cores - 1) + "\n";
 }
 
 static int createFakeStringFd(const std::string &data) {
 #if defined(__NR_memfd_create)
-    int fd = syscall(__NR_memfd_create, "fake_cpu", MFD_CLOEXEC);
+    int fd = static_cast<int>(syscall(__NR_memfd_create, "fake_cpu", MFD_CLOEXEC));
     if (fd >= 0) {
-        write(fd, data.data(), data.size());
+        ssize_t w = write(fd, data.data(), data.size());
+        (void)w;
         lseek(fd, 0, SEEK_SET);
         return fd;
     }
 #endif
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) == 0) {
-        write(fds[1], data.data(), data.size());
+        ssize_t w = write(fds[1], data.data(), data.size());
+        (void)w;
         close(fds[1]);
         return fds[0];
     }
@@ -90,7 +142,7 @@ static int createFakeStringFd(const std::string &data) {
 }
 
 // ---------------------------------------------------------------------------
-// POSIX CPU & Cores Hooks (sysconf, get_nprocs, open, fopen)
+// POSIX CPU & Cores Hooks (sysconf, get_nprocs, open, openat, fopen)
 // ---------------------------------------------------------------------------
 static long (*orig_sysconf)(int name) = nullptr;
 static long hooked_sysconf(int name) {
@@ -228,17 +280,34 @@ static void hooked_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
 }
 
 static void (*orig_glTexParameteri)(GLenum target, GLenum pname, GLint param) = nullptr;
+static void (*orig_glTexParameterf)(GLenum target, GLenum pname, GLfloat param) = nullptr;
+
 static void hooked_glTexParameteri(GLenum target, GLenum pname, GLint param) {
     if (g_config.enabled && g_config.force16BitTextures && pname == GL_TEXTURE_MIN_FILTER) {
         param = GL_LINEAR;
     }
     if (orig_glTexParameteri) orig_glTexParameteri(target, pname, param);
+    if (g_config.enabled && g_config.shaderPreset.find("DLSS 5") != std::string::npos && orig_glTexParameterf) {
+        orig_glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
+    }
+}
+
+static void hooked_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
+    if (g_config.enabled && g_config.shaderPreset.find("DLSS 5") != std::string::npos && pname == GL_TEXTURE_MAX_ANISOTROPY_EXT) {
+        param = 16.0f;
+    }
+    if (orig_glTexParameterf) orig_glTexParameterf(target, pname, param);
 }
 
 // ---------------------------------------------------------------------------
 // GLSL Shader Engine: Universal Skin Tone & Turf Protection
 // ---------------------------------------------------------------------------
 static std::string findFragOutputVar(const std::string &src) {
+    // Skip MRT GBuffer passes to avoid altering surface normals
+    static const std::regex mrtRegex(R"(layout\s*\(\s*location\s*=\s*[1-9]\s*\)\s*out\b)");
+    if (std::regex_search(src, mrtRegex)) {
+        return "";
+    }
     if (src.find("gl_FragColor") != std::string::npos) {
         return "gl_FragColor";
     }
@@ -247,7 +316,7 @@ static std::string findFragOutputVar(const std::string &src) {
     if (std::regex_search(src, match, layoutOutRegex)) {
         return match[1].str();
     }
-    static const std::regex simpleOutRegex(R"(out\s+(?:mediump\s+|highp\s+|lowp\s+)?vec4\s+([a-zA-Z0-9_]+))");
+    static const std::regex simpleOutRegex(R"(\bout\s+(?:mediump\s+|highp\s+|lowp\s+)?vec4\s+([a-zA-Z0-9_]+))");
     if (std::regex_search(src, match, simpleOutRegex)) {
         return match[1].str();
     }
@@ -348,8 +417,54 @@ std::string injectGlslShaderEffect(const std::string &src) {
     return modified;
 }
 
+static GLuint (*orig_glCreateShader)(GLenum type) = nullptr;
+static GLuint hooked_glCreateShader(GLenum type) {
+    GLuint id = orig_glCreateShader ? orig_glCreateShader(type) : 0;
+    if (id != 0) {
+        std::lock_guard<std::mutex> lock(g_shaderMutex);
+        g_shaderTypes[id] = type;
+    }
+    return id;
+}
+
+static void (*orig_glShaderSource)(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) = nullptr;
+static void hooked_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
+    if (!orig_glShaderSource) return;
+    if (!g_config.enabled || !string || count <= 0) {
+        orig_glShaderSource(shader, count, string, length);
+        return;
+    }
+
+    GLenum shaderType = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_shaderMutex);
+        auto it = g_shaderTypes.find(shader);
+        if (it != g_shaderTypes.end()) shaderType = it->second;
+    }
+
+    if (shaderType != 0x8B30 /* GL_FRAGMENT_SHADER */) {
+        orig_glShaderSource(shader, count, string, length);
+        return;
+    }
+
+    std::string combined;
+    for (GLsizei i = 0; i < count; ++i) {
+        if (!string[i]) continue;
+        if (length && length[i] >= 0) {
+            combined.append(string[i], static_cast<size_t>(length[i]));
+        } else {
+            combined.append(string[i]);
+        }
+    }
+
+    std::string patched = injectGlslShaderEffect(combined);
+    const GLchar *patchedPtr = patched.c_str();
+    GLint patchedLen = static_cast<GLint>(patched.size());
+    orig_glShaderSource(shader, 1, &patchedPtr, &patchedLen);
+}
+
 // ---------------------------------------------------------------------------
-// Sleep Compression & VSync Uncapping
+// Sleep Compression, VSync Uncapping & EGL Context Spoofing
 // ---------------------------------------------------------------------------
 static int (*orig_usleep)(useconds_t usec) = nullptr;
 static int hooked_usleep(useconds_t usec) {
@@ -371,6 +486,18 @@ static int hooked_nanosleep(const struct timespec *req, struct timespec *rem) {
     return orig_nanosleep ? orig_nanosleep(req, rem) : nanosleep(req, rem);
 }
 
+static EGLContext (*orig_eglCreateContext)(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint *attrib_list) = nullptr;
+static EGLContext hooked_eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint *attrib_list) {
+    if (g_config.enabled && g_config.targetGlMajor == 2 && attrib_list) {
+        for (int i = 0; attrib_list[i] != 0x3038 /* EGL_NONE */; i += 2) {
+            if (attrib_list[i] == EGL_CONTEXT_CLIENT_VERSION && attrib_list[i + 1] >= 3) {
+                return EGL_NO_CONTEXT;
+            }
+        }
+    }
+    return orig_eglCreateContext ? orig_eglCreateContext(dpy, config, share_context, attrib_list) : EGL_NO_CONTEXT;
+}
+
 static EGLBoolean (*orig_eglSwapInterval)(EGLDisplay dpy, EGLint interval) = nullptr;
 static EGLBoolean hooked_eglSwapInterval(EGLDisplay dpy, EGLint interval) {
     if (g_config.enabled && g_vsyncUncapActive) {
@@ -387,6 +514,67 @@ static EGLBoolean hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     return orig_eglSwapBuffers ? orig_eglSwapBuffers(dpy, surface) : EGL_TRUE;
 }
 
+static void* (*orig_eglGetProcAddress)(const char *procname) = nullptr;
+static void* hooked_eglGetProcAddress(const char *procname) {
+    if (g_config.enabled && procname) {
+        if (strcmp(procname, "glGetString") == 0) return (void*)hooked_glGetString;
+        if (strcmp(procname, "glGetStringi") == 0) return (void*)hooked_glGetStringi;
+        if (strcmp(procname, "glGetIntegerv") == 0) return (void*)hooked_glGetIntegerv;
+        if (strcmp(procname, "glViewport") == 0) return (void*)hooked_glViewport;
+        if (strcmp(procname, "glCreateShader") == 0) return (void*)hooked_glCreateShader;
+        if (strcmp(procname, "glShaderSource") == 0) return (void*)hooked_glShaderSource;
+        if (strcmp(procname, "glTexParameteri") == 0) return (void*)hooked_glTexParameteri;
+        if (strcmp(procname, "glTexParameterf") == 0) return (void*)hooked_glTexParameterf;
+        if (strcmp(procname, "eglCreateContext") == 0) return (void*)hooked_eglCreateContext;
+        if (strcmp(procname, "eglSwapBuffers") == 0) return (void*)hooked_eglSwapBuffers;
+        if (strcmp(procname, "eglSwapInterval") == 0) return (void*)hooked_eglSwapInterval;
+    }
+    return orig_eglGetProcAddress ? orig_eglGetProcAddress(procname) : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Loader Hooks (dlsym, dlopen, android_dlopen_ext) for Late Engines
+// ---------------------------------------------------------------------------
+static void* (*orig_dlsym)(void *handle, const char *symbol) = nullptr;
+static void* hooked_dlsym(void *handle, const char *symbol) {
+    if (g_config.enabled && symbol) {
+        if (strcmp(symbol, "glGetString") == 0) return (void*)hooked_glGetString;
+        if (strcmp(symbol, "glGetStringi") == 0) return (void*)hooked_glGetStringi;
+        if (strcmp(symbol, "glGetIntegerv") == 0) return (void*)hooked_glGetIntegerv;
+        if (strcmp(symbol, "glViewport") == 0) return (void*)hooked_glViewport;
+        if (strcmp(symbol, "glCreateShader") == 0) return (void*)hooked_glCreateShader;
+        if (strcmp(symbol, "glShaderSource") == 0) return (void*)hooked_glShaderSource;
+        if (strcmp(symbol, "glTexParameteri") == 0) return (void*)hooked_glTexParameteri;
+        if (strcmp(symbol, "glTexParameterf") == 0) return (void*)hooked_glTexParameterf;
+        if (strcmp(symbol, "eglCreateContext") == 0) return (void*)hooked_eglCreateContext;
+        if (strcmp(symbol, "eglSwapBuffers") == 0) return (void*)hooked_eglSwapBuffers;
+        if (strcmp(symbol, "eglSwapInterval") == 0) return (void*)hooked_eglSwapInterval;
+        if (strcmp(symbol, "eglGetProcAddress") == 0) return (void*)hooked_eglGetProcAddress;
+        if (strcmp(symbol, "sysconf") == 0) return (void*)hooked_sysconf;
+        if (strcmp(symbol, "get_nprocs") == 0) return (void*)hooked_get_nprocs;
+        if (strcmp(symbol, "get_nprocs_conf") == 0) return (void*)hooked_get_nprocs_conf;
+    }
+    return orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
+}
+
+static void* (*orig_dlopen)(const char *filename, int flags) = nullptr;
+static void* hooked_dlopen(const char *filename, int flags) {
+    void *res = orig_dlopen ? orig_dlopen(filename, flags) : nullptr;
+    if (res && g_config.enabled) {
+        refreshElfHooks();
+    }
+    return res;
+}
+
+static void* (*orig_android_dlopen_ext)(const char *filename, int flags, const void *extinfo) = nullptr;
+static void* hooked_android_dlopen_ext(const char *filename, int flags, const void *extinfo) {
+    void *res = orig_android_dlopen_ext ? orig_android_dlopen_ext(filename, flags, extinfo) : nullptr;
+    if (res && g_config.enabled) {
+        refreshElfHooks();
+    }
+    return res;
+}
+
 // ---------------------------------------------------------------------------
 // System Properties Spoofing
 // ---------------------------------------------------------------------------
@@ -398,34 +586,35 @@ static int hooked_system_property_get(const char *name, char *value) {
             if (strcmp(name, "ro.soc.manufacturer") == 0) {
                 std::string s = g_config.fakeCpuPlatform.find("mt") != std::string::npos ? "MediaTek" : "Qualcomm";
                 strcpy(value, s.c_str());
-                return s.length();
+                return static_cast<int>(s.length());
             }
             if (strcmp(name, "ro.soc.model") == 0) {
                 std::string s = !g_config.fakeCpuHardware.empty() ? g_config.fakeCpuHardware : "SM8650";
                 strcpy(value, s.c_str());
-                return s.length();
+                return static_cast<int>(s.length());
             }
             if (strcmp(name, "ro.board.platform") == 0) {
                 std::string s = !g_config.fakeCpuPlatform.empty() ? g_config.fakeCpuPlatform : "pineapple";
                 strcpy(value, s.c_str());
-                return s.length();
+                return static_cast<int>(s.length());
             }
             if (strcmp(name, "ro.hardware.chipname") == 0) {
                 std::string s = !g_config.fakeCpuName.empty() ? g_config.fakeCpuName : "Qualcomm Snapdragon 8 Gen 3";
                 strcpy(value, s.c_str());
-                return s.length();
+                return static_cast<int>(s.length());
             }
             if (strcmp(name, "ro.hardware") == 0) {
                 std::string s = g_config.fakeCpuPlatform.find("mt") != std::string::npos ? "mt6989" : "qcom";
                 strcpy(value, s.c_str());
-                return s.length();
+                return static_cast<int>(s.length());
             }
         }
         // GLES Version
         if (strcmp(name, "ro.opengles.version") == 0 && g_config.targetGlMajor > 0) {
-            uint32_t ver = (g_config.targetGlMajor << 16) | (g_config.targetGlMinor << 8);
+            uint32_t ver = (static_cast<uint32_t>(g_config.targetGlMajor) << 16) |
+                           (static_cast<uint32_t>(g_config.targetGlMinor) << 8);
             sprintf(value, "%u", ver);
-            return strlen(value);
+            return static_cast<int>(strlen(value));
         }
     }
     return orig_system_property_get ? orig_system_property_get(name, value) : 0;
@@ -453,10 +642,11 @@ bool parseConfigString(const std::string &content, GameConfig &outConfig) {
     std::istringstream stream(content);
     std::string line;
     while (std::getline(stream, line)) {
-        size_t eq = line.find("=");
+        size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
+        if (!val.empty() && val.back() == '\r') val.pop_back();
 
         if (key == "enabled") outConfig.enabled = (val == "true" || val == "1");
         else if (key == "packageName") outConfig.packageName = val;
@@ -474,7 +664,7 @@ bool parseConfigString(const std::string &content, GameConfig &outConfig) {
                 if (!ext.empty()) outConfig.extensionList.push_back(ext);
             }
         }
-        else if (key == "resolutionScale") outConfig.resolutionScale = std::atof(val.c_str());
+        else if (key == "resolutionScale") outConfig.resolutionScale = static_cast<float>(std::atof(val.c_str()));
         else if (key == "force16BitTextures") outConfig.force16BitTextures = (val == "true" || val == "1");
         else if (key == "forceFp16Shaders") outConfig.forceFp16Shaders = (val == "true" || val == "1");
         else if (key == "shaderPreset") outConfig.shaderPreset = val;
@@ -496,62 +686,207 @@ void loadAppConfigFromCompanion(int socketFd, GameConfig &outConfig) {
     char buffer[8192];
     ssize_t bytesRead = read(socketFd, buffer, sizeof(buffer) - 1);
     if (bytesRead > 0) {
-        buffer[bytesRead] = "\0";
+        buffer[bytesRead] = '\0';
         parseConfigString(buffer, outConfig);
     }
 }
 
 // ---------------------------------------------------------------------------
-// PLT / GOT Hooking Engine
+// PLT / GOT Relocation Patcher & Zygisk PLT Hooking Engine
 // ---------------------------------------------------------------------------
-static void hookSymbolInElf(const char *libPath, const char *symbol, void *hookFunc, void **origFunc) {
-    void *handle = dlopen(libPath, RTLD_NOLOAD);
-    if (!handle) handle = dlopen(libPath, RTLD_NOW);
-    if (!handle) return;
+struct PltHookTarget {
+    const char *symbol;
+    void *newFunc;
+    void **oldFunc;
+};
 
-    void *sym = dlsym(handle, symbol);
-    if (sym && origFunc && !*origFunc) {
-        *origFunc = sym;
+static const PltHookTarget g_hookTargets[] = {
+    {"sysconf", (void*)hooked_sysconf, (void**)&orig_sysconf},
+    {"get_nprocs", (void*)hooked_get_nprocs, (void**)&orig_get_nprocs},
+    {"get_nprocs_conf", (void*)hooked_get_nprocs_conf, (void**)&orig_get_nprocs_conf},
+    {"open", (void*)hooked_open, (void**)&orig_open},
+    {"openat", (void*)hooked_openat, (void**)&orig_openat},
+    {"fopen", (void*)hooked_fopen, (void**)&orig_fopen},
+    {"usleep", (void*)hooked_usleep, (void**)&orig_usleep},
+    {"nanosleep", (void*)hooked_nanosleep, (void**)&orig_nanosleep},
+    {"__system_property_get", (void*)hooked_system_property_get, (void**)&orig_system_property_get},
+    {"glGetString", (void*)hooked_glGetString, (void**)&orig_glGetString},
+    {"glGetStringi", (void*)hooked_glGetStringi, (void**)&orig_glGetStringi},
+    {"glGetIntegerv", (void*)hooked_glGetIntegerv, (void**)&orig_glGetIntegerv},
+    {"glViewport", (void*)hooked_glViewport, (void**)&orig_glViewport},
+    {"glCreateShader", (void*)hooked_glCreateShader, (void**)&orig_glCreateShader},
+    {"glShaderSource", (void*)hooked_glShaderSource, (void**)&orig_glShaderSource},
+    {"glTexParameteri", (void*)hooked_glTexParameteri, (void**)&orig_glTexParameteri},
+    {"glTexParameterf", (void*)hooked_glTexParameterf, (void**)&orig_glTexParameterf},
+    {"eglCreateContext", (void*)hooked_eglCreateContext, (void**)&orig_eglCreateContext},
+    {"eglSwapBuffers", (void*)hooked_eglSwapBuffers, (void**)&orig_eglSwapBuffers},
+    {"eglSwapInterval", (void*)hooked_eglSwapInterval, (void**)&orig_eglSwapInterval},
+    {"eglGetProcAddress", (void*)hooked_eglGetProcAddress, (void**)&orig_eglGetProcAddress},
+    {"dlsym", (void*)hooked_dlsym, (void**)&orig_dlsym},
+    {"dlopen", (void*)hooked_dlopen, (void**)&orig_dlopen},
+    {"android_dlopen_ext", (void*)hooked_android_dlopen_ext, (void**)&orig_android_dlopen_ext},
+};
+
+static void patchGotSlot(Elf_Addr *slot, void *newFunc, void **oldFunc) {
+    if (!slot || *slot == reinterpret_cast<Elf_Addr>(newFunc)) return;
+    uintptr_t pageSize = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    uintptr_t pageStart = reinterpret_cast<uintptr_t>(slot) & ~(pageSize - 1);
+    if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_WRITE) == 0) {
+        if (oldFunc && !*oldFunc && *slot != 0) {
+            *oldFunc = reinterpret_cast<void*>(*slot);
+        }
+        *slot = reinterpret_cast<Elf_Addr>(newFunc);
     }
 }
 
-void initHooks(const GameConfig &config, JNIEnv *env) {
+static int elfRelocPatchCallback(struct dl_phdr_info *info, [[maybe_unused]] size_t size, [[maybe_unused]] void *data) {
+    if (!info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
+    if (strstr(info->dlpi_name, "libzygisk_gltools.so") != nullptr ||
+        strstr(info->dlpi_name, "ld-android.so") != nullptr ||
+        strstr(info->dlpi_name, "linker") != nullptr) {
+        return 0;
+    }
+
+    const Elf_Dyn *dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<const Elf_Dyn*>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return 0;
+
+    const Elf_Sym *symtab = nullptr;
+    const char *strtab = nullptr;
+    const void *jmprel = nullptr;
+    size_t pltrelsz = 0;
+    int pltrelType = 0;
+
+    for (; dyn->d_tag != DT_NULL; ++dyn) {
+        switch (dyn->d_tag) {
+            case DT_SYMTAB: symtab = reinterpret_cast<const Elf_Sym*>(dyn->d_un.d_ptr > info->dlpi_addr ? dyn->d_un.d_ptr : info->dlpi_addr + dyn->d_un.d_ptr); break;
+            case DT_STRTAB: strtab = reinterpret_cast<const char*>(dyn->d_un.d_ptr > info->dlpi_addr ? dyn->d_un.d_ptr : info->dlpi_addr + dyn->d_un.d_ptr); break;
+            case DT_JMPREL: jmprel = reinterpret_cast<const void*>(dyn->d_un.d_ptr > info->dlpi_addr ? dyn->d_un.d_ptr : info->dlpi_addr + dyn->d_un.d_ptr); break;
+            case DT_PLTRELSZ: pltrelsz = dyn->d_un.d_val; break;
+            case DT_PLTREL: pltrelType = static_cast<int>(dyn->d_un.d_val); break;
+        }
+    }
+
+    if (!symtab || !strtab || !jmprel || pltrelsz == 0) return 0;
+
+    if (pltrelType == DT_RELA) {
+        const auto *rela = static_cast<const Elf_Rela*>(jmprel);
+        size_t count = pltrelsz / sizeof(Elf_Rela);
+        for (size_t i = 0; i < count; ++i) {
+            size_t symIdx = ELF_R_SYM(rela[i].r_info);
+            if (symIdx == 0) continue;
+            const char *symName = strtab + symtab[symIdx].st_name;
+            for (const auto &t : g_hookTargets) {
+                if (strcmp(symName, t.symbol) == 0) {
+                    auto *slot = reinterpret_cast<Elf_Addr*>(info->dlpi_addr + rela[i].r_offset);
+                    patchGotSlot(slot, t.newFunc, t.oldFunc);
+                    break;
+                }
+            }
+        }
+    } else if (pltrelType == DT_REL) {
+        const auto *rel = static_cast<const Elf_Rel*>(jmprel);
+        size_t count = pltrelsz / sizeof(Elf_Rel);
+        for (size_t i = 0; i < count; ++i) {
+            size_t symIdx = ELF_R_SYM(rel[i].r_info);
+            if (symIdx == 0) continue;
+            const char *symName = strtab + symtab[symIdx].st_name;
+            for (const auto &t : g_hookTargets) {
+                if (strcmp(symName, t.symbol) == 0) {
+                    auto *slot = reinterpret_cast<Elf_Addr*>(info->dlpi_addr + rel[i].r_offset);
+                    patchGotSlot(slot, t.newFunc, t.oldFunc);
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static void refreshElfHooks() {
+    dl_iterate_phdr(elfRelocPatchCallback, nullptr);
+}
+
+static int zygiskPhdrCallback(struct dl_phdr_info *info, [[maybe_unused]] size_t size, void *data) {
+    if (!info->dlpi_name || info->dlpi_name[0] == '\0') return 0;
+    if (strstr(info->dlpi_name, "libzygisk_gltools.so") != nullptr) return 0;
+
+    auto *api = static_cast<zygisk::Api*>(data);
+    struct stat st{};
+    if (stat(info->dlpi_name, &st) != 0) return 0;
+
+    for (const auto &t : g_hookTargets) {
+        api->pltHookRegister(st.st_dev, st.st_ino, t.symbol, t.newFunc, t.oldFunc);
+    }
+    return 0;
+}
+
+static void resolveDefaultOriginals() {
+    void *libdl = dlopen("libdl.so", RTLD_NOLOAD);
+    if (!libdl) libdl = dlopen("libdl.so", RTLD_NOW);
+    if (libdl) {
+        if (!orig_dlsym) orig_dlsym = (decltype(orig_dlsym))dlsym(libdl, "dlsym");
+        if (!orig_dlopen) orig_dlopen = (decltype(orig_dlopen))dlsym(libdl, "dlopen");
+        if (!orig_android_dlopen_ext) orig_android_dlopen_ext = (decltype(orig_android_dlopen_ext))dlsym(libdl, "android_dlopen_ext");
+    }
+
+    void *libc = dlopen("libc.so", RTLD_NOLOAD);
+    if (!libc) libc = dlopen("libc.so", RTLD_NOW);
+    if (libc) {
+        if (!orig_sysconf) orig_sysconf = (decltype(orig_sysconf))dlsym(libc, "sysconf");
+        if (!orig_get_nprocs) orig_get_nprocs = (decltype(orig_get_nprocs))dlsym(libc, "get_nprocs");
+        if (!orig_get_nprocs_conf) orig_get_nprocs_conf = (decltype(orig_get_nprocs_conf))dlsym(libc, "get_nprocs_conf");
+        if (!orig_open) orig_open = (decltype(orig_open))dlsym(libc, "open");
+        if (!orig_openat) orig_openat = (decltype(orig_openat))dlsym(libc, "openat");
+        if (!orig_fopen) orig_fopen = (decltype(orig_fopen))dlsym(libc, "fopen");
+        if (!orig_usleep) orig_usleep = (decltype(orig_usleep))dlsym(libc, "usleep");
+        if (!orig_nanosleep) orig_nanosleep = (decltype(orig_nanosleep))dlsym(libc, "nanosleep");
+        if (!orig_system_property_get) orig_system_property_get = (decltype(orig_system_property_get))dlsym(libc, "__system_property_get");
+    }
+
+    void *gles = dlopen("libGLESv2.so", RTLD_NOLOAD);
+    if (!gles) gles = dlopen("libGLESv2.so", RTLD_NOW);
+    if (gles) {
+        if (!orig_glGetString) orig_glGetString = (decltype(orig_glGetString))dlsym(gles, "glGetString");
+        if (!orig_glGetStringi) orig_glGetStringi = (decltype(orig_glGetStringi))dlsym(gles, "glGetStringi");
+        if (!orig_glGetIntegerv) orig_glGetIntegerv = (decltype(orig_glGetIntegerv))dlsym(gles, "glGetIntegerv");
+        if (!orig_glViewport) orig_glViewport = (decltype(orig_glViewport))dlsym(gles, "glViewport");
+        if (!orig_glCreateShader) orig_glCreateShader = (decltype(orig_glCreateShader))dlsym(gles, "glCreateShader");
+        if (!orig_glShaderSource) orig_glShaderSource = (decltype(orig_glShaderSource))dlsym(gles, "glShaderSource");
+        if (!orig_glTexParameteri) orig_glTexParameteri = (decltype(orig_glTexParameteri))dlsym(gles, "glTexParameteri");
+        if (!orig_glTexParameterf) orig_glTexParameterf = (decltype(orig_glTexParameterf))dlsym(gles, "glTexParameterf");
+    }
+
+    void *egl = dlopen("libEGL.so", RTLD_NOLOAD);
+    if (!egl) egl = dlopen("libEGL.so", RTLD_NOW);
+    if (egl) {
+        if (!orig_eglCreateContext) orig_eglCreateContext = (decltype(orig_eglCreateContext))dlsym(egl, "eglCreateContext");
+        if (!orig_eglSwapBuffers) orig_eglSwapBuffers = (decltype(orig_eglSwapBuffers))dlsym(egl, "eglSwapBuffers");
+        if (!orig_eglSwapInterval) orig_eglSwapInterval = (decltype(orig_eglSwapInterval))dlsym(egl, "eglSwapInterval");
+        if (!orig_eglGetProcAddress) orig_eglGetProcAddress = (decltype(orig_eglGetProcAddress))dlsym(egl, "eglGetProcAddress");
+    }
+}
+
+void initHooks(const GameConfig &config, zygisk::Api *api, JNIEnv *env) {
     g_config = config;
     g_spoofedExtensionsStr = config.extensions;
     g_spoofedExtensionsList = config.extensionList;
     g_vsyncUncapActive = (config.frameGenMode == "2x (120 FPS)" || config.frameGenMode == "Uncapped");
 
-    LOGI("Installing GLTools hooks for %s [FakeCPU: %s (%d cores) | GLES: %d.%d | Shader: %s]",
-         config.packageName.c_str(),
-         config.fakeCpuEnabled ? config.fakeCpuName.c_str() : "Disabled",
-         config.fakeCpuCores,
-         config.targetGlMajor, config.targetGlMinor,
-         config.shaderPreset.c_str());
+    resolveDefaultOriginals();
 
-    // 1. Hook POSIX CPU & Cores in libc.so
-    hookSymbolInElf("libc.so", "sysconf", (void*)hooked_sysconf, (void**)&orig_sysconf);
-    hookSymbolInElf("libc.so", "get_nprocs", (void*)hooked_get_nprocs, (void**)&orig_get_nprocs);
-    hookSymbolInElf("libc.so", "get_nprocs_conf", (void*)hooked_get_nprocs_conf, (void**)&orig_get_nprocs_conf);
-    hookSymbolInElf("libc.so", "open", (void*)hooked_open, (void**)&orig_open);
-    hookSymbolInElf("libc.so", "openat", (void*)hooked_openat, (void**)&orig_openat);
-    hookSymbolInElf("libc.so", "fopen", (void*)hooked_fopen, (void**)&orig_fopen);
-    hookSymbolInElf("libc.so", "usleep", (void*)hooked_usleep, (void**)&orig_usleep);
-    hookSymbolInElf("libc.so", "nanosleep", (void*)hooked_nanosleep, (void**)&orig_nanosleep);
-    hookSymbolInElf("libc.so", "__system_property_get", (void*)hooked_system_property_get, (void**)&orig_system_property_get);
+    if (api) {
+        dl_iterate_phdr(zygiskPhdrCallback, api);
+        api->pltHookCommit();
+    }
+    refreshElfHooks();
 
-    // 2. Hook GLES / EGL symbols
-    hookSymbolInElf("libGLESv2.so", "glGetString", (void*)hooked_glGetString, (void**)&orig_glGetString);
-    hookSymbolInElf("libGLESv3.so", "glGetString", (void*)hooked_glGetString, (void**)&orig_glGetString);
-    hookSymbolInElf("libGLESv3.so", "glGetStringi", (void*)hooked_glGetStringi, (void**)&orig_glGetStringi);
-    hookSymbolInElf("libGLESv2.so", "glGetIntegerv", (void*)hooked_glGetIntegerv, (void**)&orig_glGetIntegerv);
-    hookSymbolInElf("libGLESv3.so", "glGetIntegerv", (void*)hooked_glGetIntegerv, (void**)&orig_glGetIntegerv);
-    hookSymbolInElf("libGLESv2.so", "glViewport", (void*)hooked_glViewport, (void**)&orig_glViewport);
-    hookSymbolInElf("libGLESv3.so", "glViewport", (void*)hooked_glViewport, (void**)&orig_glViewport);
-    hookSymbolInElf("libGLESv2.so", "glTexParameteri", (void*)hooked_glTexParameteri, (void**)&orig_glTexParameteri);
-    hookSymbolInElf("libEGL.so", "eglSwapBuffers", (void*)hooked_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    hookSymbolInElf("libEGL.so", "eglSwapInterval", (void*)hooked_eglSwapInterval, (void**)&orig_eglSwapInterval);
-
-    // 3. Spoof Java Build properties via JNI
+    // Spoof Java Build properties via JNI
     if (env) {
         jclass buildClass = env->FindClass("android/os/Build");
         if (buildClass) {
@@ -567,4 +902,12 @@ void initHooks(const GameConfig &config, JNIEnv *env) {
             env->ExceptionClear();
         }
     }
+
+    LOGI("GLTools hooks installed for %s [FakeCPU: %s (%d cores) | GLES: %d.%d | Shader: %s | FrameGen: %s]",
+         config.packageName.c_str(),
+         config.fakeCpuEnabled ? config.fakeCpuName.c_str() : "Disabled",
+         config.fakeCpuCores,
+         config.targetGlMajor, config.targetGlMinor,
+         config.shaderPreset.c_str(),
+         config.frameGenMode.c_str());
 }

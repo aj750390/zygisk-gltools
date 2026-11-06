@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <jni.h>
+#include "zygisk.hpp"
 
 struct GameConfig {
     bool enabled = false;
@@ -30,6 +31,6 @@ struct GameConfig {
     int fakeCpuCores = 8;
 };
 
-void initHooks(const GameConfig &config, JNIEnv *env);
+void initHooks(const GameConfig &config, zygisk::Api *api, JNIEnv *env);
 bool parseConfigString(const std::string &content, GameConfig &outConfig);
 void loadAppConfigFromCompanion(int socketFd, GameConfig &outConfig);

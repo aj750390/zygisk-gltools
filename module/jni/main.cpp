@@ -23,32 +23,43 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        if (!args || !args->nice_name) return;
+        if (!args || !args->nice_name) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
         const char *processName = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!processName) return;
+        if (!processName) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
 
         std::string pkg = processName;
         env->ReleaseStringUTFChars(args->nice_name, processName);
 
-        // Fetch configuration from root companion daemon
         int fd = api->connectCompanion();
         if (fd >= 0) {
-            uint32_t len = pkg.length();
-            write(fd, &len, sizeof(len));
-            write(fd, pkg.data(), len);
+            uint32_t len = static_cast<uint32_t>(pkg.length());
+            ssize_t w1 = write(fd, &len, sizeof(len));
+            ssize_t w2 = write(fd, pkg.data(), len);
+            (void)w1;
+            (void)w2;
 
             loadAppConfigFromCompanion(fd, g_appConfig);
             close(fd);
         }
-    }
 
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (g_appConfig.enabled) {
-            initHooks(g_appConfig, env);
+        if (!g_appConfig.enabled) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
         }
     }
 
-    void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+    void postAppSpecialize([[maybe_unused]] const zygisk::AppSpecializeArgs *args) override {
+        if (g_appConfig.enabled) {
+            initHooks(g_appConfig, api, env);
+        }
+    }
+
+    void preServerSpecialize([[maybe_unused]] zygisk::ServerSpecializeArgs *args) override {
         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
@@ -77,7 +88,8 @@ static void gltoolsCompanionHandler(int client) {
         char buf[4096];
         ssize_t n;
         while ((n = read(fd, buf, sizeof(buf))) > 0) {
-            write(client, buf, n);
+            ssize_t w = write(client, buf, static_cast<size_t>(n));
+            (void)w;
         }
         close(fd);
     }
