@@ -1,46 +1,101 @@
 package com.gltools.zygisk
 
+import android.util.Base64
 import java.io.File
 
 object RootConfigManager {
     private const val CONFIG_DIR = "/data/adb/gltools/packages"
+    private val configCache = mutableMapOf<String, GameConfig>()
 
-    fun loadConfig(packageName: String): GameConfig {
-        val config = GameConfig(packageName = packageName)
+    fun refreshAllConfigs() {
+        configCache.clear()
         try {
-            val file = File("$CONFIG_DIR/$packageName.conf")
-            if (file.exists()) {
-                file.readLines().forEach { line ->
-                    val parts = line.split("=", limit = 2)
-                    if (parts.size == 2) {
-                        val key = parts[0].trim()
-                        val value = parts[1].trim()
-                        when (key) {
-                            "enabled" -> config.enabled = value.toBoolean()
-                            "targetGlMajor" -> config.targetGlMajor = value.toIntOrNull() ?: 0
-                            "targetGlMinor" -> config.targetGlMinor = value.toIntOrNull() ?: 0
-                            "renderer" -> config.renderer = value
-                            "vendor" -> config.vendor = value
-                            "version" -> config.version = value
-                            "extensions" -> config.extensions = value
-                            "resolutionScale" -> config.resolutionScale = value.toFloatOrNull() ?: 1.0f
-                            "force16BitTextures" -> config.force16BitTextures = value.toBoolean()
-                            "forceFp16Shaders" -> config.forceFp16Shaders = value.toBoolean()
-                            "shaderPreset" -> config.shaderPreset = value
-                            "customGlsl" -> config.customGlsl = value
-                            "frameGenMode" -> config.frameGenMode = value
-                            "fakeCpuEnabled" -> config.fakeCpuEnabled = value.toBoolean()
-                            "fakeCpuPreset" -> config.fakeCpuPreset = value
-                            "fakeCpuName" -> config.fakeCpuName = value
-                            "fakeCpuHardware" -> config.fakeCpuHardware = value
-                            "fakeCpuPlatform" -> config.fakeCpuPlatform = value
-                            "fakeCpuCores" -> config.fakeCpuCores = value.toIntOrNull() ?: 8
-                        }
-                    }
+            val process = Runtime.getRuntime().exec(
+                arrayOf("su", "-c", "for f in $CONFIG_DIR/*.conf; do [ -f \"\$f\" ] && echo \"===FILE:\$f===\" && cat \"\$f\"; done")
+            )
+            val output = process.inputStream.bufferedReader().readText()
+            process.waitFor()
+
+            var currentPkg = ""
+            val sb = StringBuilder()
+
+            fun flushCurrent() {
+                if (currentPkg.isNotEmpty()) {
+                    configCache[currentPkg] = parseConfigText(currentPkg, sb.toString())
                 }
             }
+
+            for (line in output.lines()) {
+                if (line.startsWith("===FILE:") && line.endsWith("===")) {
+                    flushCurrent()
+                    sb.clear()
+                    val path = line.removePrefix("===FILE:").removeSuffix("===")
+                    currentPkg = File(path).name.removeSuffix(".conf")
+                } else {
+                    sb.append(line).append("\n")
+                }
+            }
+            flushCurrent()
+        } catch (_: Exception) {}
+    }
+
+    fun getCachedConfig(packageName: String): GameConfig {
+        return configCache[packageName] ?: GameConfig(packageName = packageName)
+    }
+
+    fun loadConfig(packageName: String): GameConfig {
+        val targetPath = "$CONFIG_DIR/$packageName.conf"
+        return try {
+            val directFile = File(targetPath)
+            val text = if (directFile.exists() && directFile.canRead()) {
+                directFile.readText()
+            } else {
+                val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "cat $targetPath 2>/dev/null"))
+                val out = proc.inputStream.bufferedReader().readText()
+                proc.waitFor()
+                out
+            }
+            if (text.isNotBlank()) {
+                val cfg = parseConfigText(packageName, text)
+                configCache[packageName] = cfg
+                cfg
+            } else {
+                configCache[packageName] ?: GameConfig(packageName = packageName)
+            }
         } catch (e: Exception) {
-            e.printStackTrace()
+            configCache[packageName] ?: GameConfig(packageName = packageName)
+        }
+    }
+
+    private fun parseConfigText(packageName: String, text: String): GameConfig {
+        val config = GameConfig(packageName = packageName)
+        for (line in text.lines()) {
+            val parts = line.split("=", limit = 2)
+            if (parts.size == 2) {
+                val key = parts[0].trim()
+                val value = parts[1].trim()
+                when (key) {
+                    "enabled" -> config.enabled = (value == "true" || value == "1")
+                    "targetGlMajor" -> config.targetGlMajor = value.toIntOrNull() ?: 0
+                    "targetGlMinor" -> config.targetGlMinor = value.toIntOrNull() ?: 0
+                    "renderer" -> config.renderer = value
+                    "vendor" -> config.vendor = value
+                    "version" -> config.version = value
+                    "extensions" -> config.extensions = value
+                    "resolutionScale" -> config.resolutionScale = value.toFloatOrNull() ?: 1.0f
+                    "force16BitTextures" -> config.force16BitTextures = (value == "true" || value == "1")
+                    "forceFp16Shaders" -> config.forceFp16Shaders = (value == "true" || value == "1")
+                    "shaderPreset" -> config.shaderPreset = value
+                    "customGlsl" -> config.customGlsl = value
+                    "frameGenMode" -> config.frameGenMode = value
+                    "fakeCpuEnabled" -> config.fakeCpuEnabled = (value == "true" || value == "1")
+                    "fakeCpuPreset" -> config.fakeCpuPreset = value
+                    "fakeCpuName" -> config.fakeCpuName = value
+                    "fakeCpuHardware" -> config.fakeCpuHardware = value
+                    "fakeCpuPlatform" -> config.fakeCpuPlatform = value
+                    "fakeCpuCores" -> config.fakeCpuCores = value.toIntOrNull() ?: 8
+                }
+            }
         }
         return config
     }
@@ -69,23 +124,36 @@ object RootConfigManager {
         sb.append("fakeCpuCores=${config.fakeCpuCores}\n")
 
         val content = sb.toString()
-        val tempPath = "/data/local/tmp/${config.packageName}.conf"
         val targetPath = "$CONFIG_DIR/${config.packageName}.conf"
+        val b64 = Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
+        // Method 1: Direct su -c with Base64 decode (immune to heredoc indentation & special chars)
+        try {
+            val cmd = "mkdir -p $CONFIG_DIR && chmod 755 /data/adb/gltools $CONFIG_DIR && echo '$b64' | base64 -d > $targetPath && chmod 644 $targetPath"
+            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            if (proc.waitFor() == 0) {
+                configCache[config.packageName] = config
+                return true
+            }
+        } catch (_: Exception) {}
+
+        // Method 2: Interactive su shell piping (fallback)
         return try {
             val process = Runtime.getRuntime().exec("su")
             val os = process.outputStream
-            val script = """
-                mkdir -p $CONFIG_DIR
-                cat << EOF > $targetPath
-                $content
-                EOF
-                chmod 644 $targetPath
-            """.trimIndent()
-            os.write(script.toByteArray())
+            val script = "mkdir -p $CONFIG_DIR\n" +
+                "chmod 755 /data/adb/gltools $CONFIG_DIR\n" +
+                "echo '$b64' | base64 -d > $targetPath\n" +
+                "chmod 644 $targetPath\n" +
+                "exit\n"
+            os.write(script.toByteArray(Charsets.UTF_8))
             os.flush()
             os.close()
-            process.waitFor() == 0
+            val ok = process.waitFor() == 0
+            if (ok) {
+                configCache[config.packageName] = config
+            }
+            ok
         } catch (e: Exception) {
             e.printStackTrace()
             false
