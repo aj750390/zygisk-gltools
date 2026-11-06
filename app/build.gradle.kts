@@ -11,24 +11,21 @@ android {
         applicationId = "com.gltools.zygisk"
         minSdk = 26
         targetSdk = 34
-        versionCode = 100
+        versionCode = 1
         versionName = "1.0.0"
-
-        ndk {
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86"))
-        }
 
         externalNativeBuild {
             cmake {
-                cppFlags("-std=c++20")
+                cppFlags("-std=c++20", "-Wall", "-Wextra", "-fvisibility=hidden")
                 arguments("-DANDROID_STL=c++_static")
+                abiFilters("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
             }
         }
     }
 
     externalNativeBuild {
         cmake {
-            path = file("../module/CMakeLists.txt")
+            path = file("../../module/jni/CMakeLists.txt")
             version = "3.22.1"
         }
     }
@@ -36,26 +33,22 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
     kotlinOptions {
         jvmTarget = "17"
     }
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.recyclerview:recyclerview:1.3.2")
-    implementation("androidx.cardview:cardview:1.0.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
+    implementation("com.google.android.material:material:1.11.0")
 }
