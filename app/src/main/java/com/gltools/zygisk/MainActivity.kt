@@ -238,10 +238,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun getCpuModel(): String {
         try {
-            File("/proc/cpuinfo").forEachLine { line ->
+            val lines = File("/proc/cpuinfo").readLines()
+            for (line in lines) {
                 if (line.startsWith("Hardware") || line.startsWith("model name")) {
                     val parts = line.split(":", limit = 2)
-                    if (parts.size == 2) return parts[1].trim()
+                    if (parts.size == 2 && parts[1].trim().isNotEmpty()) {
+                        return parts[1].trim()
+                    }
                 }
             }
         } catch (_: Exception) {}
