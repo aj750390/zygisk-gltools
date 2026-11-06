@@ -1,230 +1,237 @@
 package com.gltools.zygisk
 
 import android.os.Bundle
-import android.widget.ArrayAdapter
-import android.widget.AutoCompleteTextView
-import android.widget.SeekBar
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import androidx.appcompat.widget.SwitchCompat
-import com.gltools.zygisk.model.GameConfig
-import com.gltools.zygisk.util.RootConfigManager
-import com.google.android.material.button.MaterialButton
-import com.google.android.material.textfield.TextInputEditText
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class AppDetailActivity : AppCompatActivity() {
 
     private lateinit var config: GameConfig
-
-    private lateinit var switchActive: SwitchCompat
-    private lateinit var actvFrameGenMode: AutoCompleteTextView
-    private lateinit var actvShaderPreset: AutoCompleteTextView
-    private lateinit var etCustomGlsl: TextInputEditText
-    private lateinit var switchFp16Shaders: SwitchCompat
-    private lateinit var actvPreset: AutoCompleteTextView
-    private lateinit var actvGlVersionPreset: AutoCompleteTextView
-    private lateinit var etVersion: TextInputEditText
-    private lateinit var actvExtensionsPreset: AutoCompleteTextView
-    private lateinit var etExtensions: TextInputEditText
-    private lateinit var etVendor: TextInputEditText
-    private lateinit var etRenderer: TextInputEditText
-    private lateinit var etModel: TextInputEditText
-    private lateinit var sbResolution: SeekBar
-    private lateinit var tvResolutionValue: TextView
-    private lateinit var switchTextures: SwitchCompat
-    private lateinit var btnSave: MaterialButton
+    private var packageName: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_app_detail)
 
-        config = intent.getSerializableExtra("EXTRA_CONFIG") as? GameConfig
-            ?: return finish()
-
-        supportActionBar?.title = config.appName
-        supportActionBar?.setDisplayHomeAsUpEnabled(true)
-
-        bindViews()
-        setupListeners()
-        populateUI()
-    }
-
-    private fun bindViews() {
-        switchActive = findViewById(R.id.switchActive)
-        actvFrameGenMode = findViewById(R.id.actvFrameGenMode)
-        actvShaderPreset = findViewById(R.id.actvShaderPreset)
-        etCustomGlsl = findViewById(R.id.etCustomGlsl)
-        switchFp16Shaders = findViewById(R.id.switchFp16Shaders)
-        actvPreset = findViewById(R.id.actvPreset)
-        actvGlVersionPreset = findViewById(R.id.actvGlVersionPreset)
-        etVersion = findViewById(R.id.etVersion)
-        actvExtensionsPreset = findViewById(R.id.actvExtensionsPreset)
-        etExtensions = findViewById(R.id.etExtensions)
-        etVendor = findViewById(R.id.etVendor)
-        etRenderer = findViewById(R.id.etRenderer)
-        etModel = findViewById(R.id.etModel)
-        sbResolution = findViewById(R.id.sbResolution)
-        tvResolutionValue = findViewById(R.id.tvResolutionValue)
-        switchTextures = findViewById(R.id.switchTextures)
-        btnSave = findViewById(R.id.btnSave)
-    }
-
-    private fun setupListeners() {
-        val frameGenList = GameConfig.FRAME_GEN_PRESETS
-        val frameGenAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, frameGenList)
-        actvFrameGenMode.setAdapter(frameGenAdapter)
-
-        actvFrameGenMode.setOnItemClickListener { _, _, position, _ ->
-            config.frameGenMode = frameGenList[position]
-            switchActive.isChecked = true
+        packageName = intent.getStringExtra("EXTRA_PACKAGE_NAME") ?: ""
+        if (packageName.isEmpty()) {
+            finish()
+            return
         }
 
-        val shaderList = GameConfig.SHADER_PRESETS
-        val shaderAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, shaderList)
-        actvShaderPreset.setAdapter(shaderAdapter)
+        config = RootConfigManager.loadConfig(packageName)
+        setupViews()
+    }
 
-        actvShaderPreset.setOnItemClickListener { _, _, position, _ ->
-            val selectedShader = shaderList[position]
-            config.shaderPreset = selectedShader
-            if (selectedShader.contains("Custom GLSL") && etCustomGlsl.text.isNullOrBlank()) {
-                etCustomGlsl.setText("color.rgb = pow(color.rgb, vec3(0.85)) * 1.18;")
+    private fun setupViews() {
+        val rootLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 32, 32, 32)
+        }
+
+        val scrollView = ScrollView(this).apply {
+            addView(rootLayout)
+        }
+        setContentView(scrollView)
+
+        // 1. Header & Master Enable
+        val titleText = TextView(this).apply {
+            text = "GLTools Settings: $packageName"
+            textSize = 20f
+            setPadding(0, 0, 0, 16)
+        }
+        rootLayout.addView(titleText)
+
+        val enableSwitch = Switch(this).apply {
+            text = "Enable GLTools for this app"
+            isChecked = config.enabled
+            setOnCheckedChangeListener { _, isChecked -> config.enabled = isChecked }
+            setPadding(0, 0, 0, 24)
+        }
+        rootLayout.addView(enableSwitch)
+
+        // -------------------------------------------------------------
+        // 2. Fake CPU & Cores Section (GLTools Feature)
+        // -------------------------------------------------------------
+        val cpuHeader = TextView(this).apply {
+            text = "CPU & Processor Spoofing"
+            textSize = 18f
+            setPadding(0, 16, 0, 8)
+        }
+        rootLayout.addView(cpuHeader)
+
+        val fakeCpuSwitch = Switch(this).apply {
+            text = "Emulate Fake CPU & Cores"
+            isChecked = config.fakeCpuEnabled
+            setOnCheckedChangeListener { _, isChecked -> config.fakeCpuEnabled = isChecked }
+        }
+        rootLayout.addView(fakeCpuSwitch)
+
+        val cpuPresetSpinner = Spinner(this)
+        val cpuPresets = arrayOf(
+            "None",
+            "Snapdragon 8 Gen 3 (8 Cores)",
+            "Snapdragon 8 Gen 2 (8 Cores)",
+            "Dimensity 9300 (8 Cores)",
+            "Apple A17 Pro (6 Cores)",
+            "Tensor G3 (9 Cores)",
+            "Custom"
+        )
+        cpuPresetSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, cpuPresets)
+        rootLayout.addView(cpuPresetSpinner)
+
+        val cpuNameEdit = EditText(this).apply {
+            hint = "Processor Name (e.g. Qualcomm Snapdragon 8 Gen 3)"
+            setText(config.fakeCpuName)
+        }
+        rootLayout.addView(cpuNameEdit)
+
+        val cpuHwEdit = EditText(this).apply {
+            hint = "Hardware String (e.g. Qualcomm Technologies, Inc SM8650)"
+            setText(config.fakeCpuHardware)
+        }
+        rootLayout.addView(cpuHwEdit)
+
+        val coresLabel = TextView(this).apply {
+            text = "CPU Cores: ${config.fakeCpuCores}"
+            setPadding(0, 8, 0, 4)
+        }
+        rootLayout.addView(coresLabel)
+
+        val coresSeekBar = SeekBar(this).apply {
+            max = 16
+            progress = if (config.fakeCpuCores in 1..16) config.fakeCpuCores else 8
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    val count = if (p < 1) 1 else p
+                    coresLabel.text = "CPU Cores: $count"
+                    config.fakeCpuCores = count
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        rootLayout.addView(coresSeekBar)
+
+        cpuPresetSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p0: AdapterView<*>?, p1: android.view.View?, pos: Int, id: Long) {
+                when (pos) {
+                    1 -> { // 8 Gen 3
+                        cpuNameEdit.setText("Qualcomm Snapdragon 8 Gen 3")
+                        cpuHwEdit.setText("Qualcomm Technologies, Inc SM8650")
+                        config.fakeCpuPlatform = "pineapple"
+                        coresSeekBar.progress = 8
+                    }
+                    2 -> { // 8 Gen 2
+                        cpuNameEdit.setText("Qualcomm Snapdragon 8 Gen 2")
+                        cpuHwEdit.setText("Qualcomm Technologies, Inc SM8550")
+                        config.fakeCpuPlatform = "kalama"
+                        coresSeekBar.progress = 8
+                    }
+                    3 -> { // Dimensity 9300
+                        cpuNameEdit.setText("MediaTek Dimensity 9300")
+                        cpuHwEdit.setText("MT6989")
+                        config.fakeCpuPlatform = "mt6989"
+                        coresSeekBar.progress = 8
+                    }
+                    4 -> { // A17 Pro
+                        cpuNameEdit.setText("Apple A17 Pro")
+                        cpuHwEdit.setText("Apple A17 Pro")
+                        config.fakeCpuPlatform = "t8130"
+                        coresSeekBar.progress = 6
+                    }
+                    5 -> { // Tensor G3
+                        cpuNameEdit.setText("Google Tensor G3")
+                        cpuHwEdit.setText("Tensor G3")
+                        config.fakeCpuPlatform = "zuma"
+                        coresSeekBar.progress = 9
+                    }
+                }
             }
-            switchActive.isChecked = true
+            override fun onNothingSelected(p0: AdapterView<*>?) {}
         }
 
-        val extPresetKeys = GameConfig.GL_EXTENSIONS_PRESETS.keys.toList()
-        val extPresetAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, extPresetKeys)
-        actvExtensionsPreset.setAdapter(extPresetAdapter)
-
-        actvExtensionsPreset.setOnItemClickListener { _, _, position, _ ->
-            val extKey = extPresetKeys[position]
-            config.extensionsPreset = extKey
-            val extVal = GameConfig.GL_EXTENSIONS_PRESETS[extKey].orEmpty()
-            config.extensions = extVal
-            etExtensions.setText(extVal)
-            switchActive.isChecked = true
+        // -------------------------------------------------------------
+        // 3. GPU Spoofing Section
+        // -------------------------------------------------------------
+        val gpuHeader = TextView(this).apply {
+            text = "GPU Spoofing"
+            textSize = 18f
+            setPadding(0, 24, 0, 8)
         }
+        rootLayout.addView(gpuHeader)
 
-        val presetKeys = GameConfig.PRESETS.keys.toList()
-        val presetAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, presetKeys)
-        actvPreset.setAdapter(presetAdapter)
-
-        val glVersionList = GameConfig.GL_VERSION_PRESETS
-        val glVersionAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, glVersionList)
-        actvGlVersionPreset.setAdapter(glVersionAdapter)
-
-        actvPreset.setOnItemClickListener { _, _, position, _ ->
-            val key = presetKeys[position]
-            GameConfig.PRESETS[key]?.let { preset ->
-                config.presetName = key
-                config.vendor = preset.vendor
-                config.renderer = preset.renderer
-                config.version = preset.version
-                config.extensions = preset.extensions
-                config.model = preset.model
-                config.manufacturer = preset.manufacturer
-                config.brand = preset.brand
-                config.device = preset.device
-                config.board = preset.board
-                config.hardware = preset.hardware
-
-                etVendor.setText(preset.vendor)
-                etRenderer.setText(preset.renderer)
-                etVersion.setText(preset.version)
-                actvGlVersionPreset.setText(preset.version, false)
-                etExtensions.setText(preset.extensions)
-                etModel.setText(preset.model)
-                switchActive.isChecked = true
-            }
+        val rendererEdit = EditText(this).apply {
+            hint = "GL_RENDERER (e.g. Adreno (TM) 750)"
+            setText(config.renderer)
         }
+        rootLayout.addView(rendererEdit)
 
-        actvGlVersionPreset.setOnItemClickListener { _, _, position, _ ->
-            val selectedVersion = glVersionList[position]
-            config.version = selectedVersion
-            etVersion.setText(selectedVersion)
-            switchActive.isChecked = true
+        val vendorEdit = EditText(this).apply {
+            hint = "GL_VENDOR (e.g. Qualcomm)"
+            setText(config.vendor)
         }
+        rootLayout.addView(vendorEdit)
 
-        sbResolution.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                val scale = 0.5f + (progress / 100f) * 0.5f
-                tvResolutionValue.text = String.format("%.0f%% (Factor: %.2fx)", scale * 100, scale)
-            }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
-
-        btnSave.setOnClickListener {
-            saveChanges()
+        val versionEdit = EditText(this).apply {
+            hint = "GL_VERSION (e.g. OpenGL ES 3.2 V@0615.0)"
+            setText(config.version)
         }
-    }
+        rootLayout.addView(versionEdit)
 
-    private fun populateUI() {
-        switchActive.isChecked = true
-        actvFrameGenMode.setText(config.frameGenMode, false)
-        actvShaderPreset.setText(config.shaderPreset, false)
-        etCustomGlsl.setText(config.customGlsl)
-        switchFp16Shaders.isChecked = config.forceFp16Shaders
-        actvPreset.setText(config.presetName, false)
-        actvGlVersionPreset.setText(config.version, false)
-        etVersion.setText(config.version)
-        actvExtensionsPreset.setText(config.extensionsPreset, false)
-        etExtensions.setText(config.extensions)
-        etVendor.setText(config.vendor)
-        etRenderer.setText(config.renderer)
-        etModel.setText(config.model)
-        switchTextures.isChecked = config.optimizeTextures
+        // -------------------------------------------------------------
+        // 4. Shader & Frame Generation
+        // -------------------------------------------------------------
+        val shaderHeader = TextView(this).apply {
+            text = "Shaders & Frame Generation"
+            textSize = 18f
+            setPadding(0, 24, 0, 8)
+        }
+        rootLayout.addView(shaderHeader)
 
-        val progress = (((config.downscaleFactor.coerceIn(0.5f, 1.0f) - 0.5f) / 0.5f) * 100).toInt()
-        sbResolution.progress = progress
-        tvResolutionValue.text = String.format("%.0f%% (Factor: %.2fx)", config.downscaleFactor * 100, config.downscaleFactor)
-    }
+        val shaderSpinner = Spinner(this)
+        val shaderOptions = arrayOf("None", "DLSS 5 Ultra", "Vibrant HDR", "Golden Hour", "ACES Filmic", "Cyberpunk Neon", "Cel-Shading", "Custom GLSL")
+        shaderSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, shaderOptions)
+        val curShaderIdx = shaderOptions.indexOf(config.shaderPreset).coerceAtLeast(0)
+        shaderSpinner.setSelection(curShaderIdx)
+        rootLayout.addView(shaderSpinner)
 
-    private fun saveChanges() {
-        config.enabled = switchActive.isChecked
-        config.frameGenMode = actvFrameGenMode.text?.toString()?.trim().orEmpty().ifEmpty { "Off (Native Framerate)" }
-        config.shaderPreset = actvShaderPreset.text?.toString()?.trim().orEmpty().ifEmpty { "None (Default Game Shaders)" }
-        config.customGlsl = etCustomGlsl.text?.toString()?.trim().orEmpty()
-        config.forceFp16Shaders = switchFp16Shaders.isChecked
-        config.version = etVersion.text?.toString()?.trim().orEmpty().ifEmpty { "OpenGL ES 3.2 V@0615.0 (GLTools)" }
-        config.extensionsPreset = actvExtensionsPreset.text?.toString()?.trim().orEmpty().ifEmpty { "Adreno 750 Flagship Extensions" }
-        config.extensions = etExtensions.text?.toString()?.trim().orEmpty()
-        config.vendor = etVendor.text?.toString()?.trim().orEmpty().ifEmpty { "Qualcomm" }
-        config.renderer = etRenderer.text?.toString()?.trim().orEmpty().ifEmpty { "Adreno (TM) 750" }
-        config.model = etModel.text?.toString()?.trim().orEmpty().ifEmpty { "SM-S928B" }
-        config.optimizeTextures = switchTextures.isChecked
-        config.downscaleFactor = 0.5f + (sbResolution.progress / 100f) * 0.5f
+        val customGlslEdit = EditText(this).apply {
+            hint = "Custom GLSL (e.g. color.rgb = pow(color.rgb, vec3(0.92)) * 1.12;)"
+            setText(config.customGlsl)
+        }
+        rootLayout.addView(customGlslEdit)
 
-        btnSave.isEnabled = false
-        CoroutineScope(Dispatchers.IO).launch {
-            val success = RootConfigManager.saveConfig(config)
-            withContext(Dispatchers.Main) {
-                btnSave.isEnabled = true
-                if (success) {
-                    Toast.makeText(
-                        this@AppDetailActivity,
-                        "Saved! Force-stop & reopen ${config.appName} to apply.",
-                        Toast.LENGTH_LONG
-                    ).show()
+        val frameGenSpinner = Spinner(this)
+        val frameGenOptions = arrayOf("Off", "2x (120 FPS)", "Uncapped")
+        frameGenSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, frameGenOptions)
+        val curFgIdx = frameGenOptions.indexOf(config.frameGenMode).coerceAtLeast(0)
+        frameGenSpinner.setSelection(curFgIdx)
+        rootLayout.addView(frameGenSpinner)
+
+        // -------------------------------------------------------------
+        // 5. Save Button
+        // -------------------------------------------------------------
+        val saveBtn = Button(this).apply {
+            text = "Save & Apply Settings"
+            setOnClickListener {
+                config.fakeCpuName = cpuNameEdit.text.toString()
+                config.fakeCpuHardware = cpuHwEdit.text.toString()
+                config.renderer = rendererEdit.text.toString()
+                config.vendor = vendorEdit.text.toString()
+                config.version = versionEdit.text.toString()
+                config.shaderPreset = shaderSpinner.selectedItem.toString()
+                config.customGlsl = customGlslEdit.text.toString()
+                config.frameGenMode = frameGenSpinner.selectedItem.toString()
+
+                val ok = RootConfigManager.saveConfig(config)
+                if (ok) {
+                    Toast.makeText(this@AppDetailActivity, "Settings Saved Successfully!", Toast.LENGTH_SHORT).show()
                     finish()
                 } else {
-                    Toast.makeText(
-                        this@AppDetailActivity,
-                        "Failed to write config. Ensure root access is granted.",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    Toast.makeText(this@AppDetailActivity, "Root permission failed!", Toast.LENGTH_LONG).show()
                 }
             }
         }
-    }
-
-    override fun onSupportNavigateUp(): Boolean {
-        finish()
-        return true
+        rootLayout.addView(saveBtn)
     }
 }
