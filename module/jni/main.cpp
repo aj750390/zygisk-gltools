@@ -84,6 +84,11 @@ static void gltoolsCompanionHandler(int client) {
     std::string pkg(pkgBuf.data());
     std::string confPath = "/data/adb/gltools/packages/" + pkg + ".conf";
     int fd = open(confPath.c_str(), O_RDONLY);
+    if (fd < 0 && pkg.find(':') != std::string::npos) {
+        std::string basePkg = pkg.substr(0, pkg.find(':'));
+        std::string baseConfPath = "/data/adb/gltools/packages/" + basePkg + ".conf";
+        fd = open(baseConfPath.c_str(), O_RDONLY);
+    }
     if (fd >= 0) {
         char buf[4096];
         ssize_t n;

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -159,7 +160,9 @@ static int hooked_get_nprocs(void) {
     if (g_config.enabled && g_config.fakeCpuEnabled && g_config.fakeCpuCores > 0) {
         return g_config.fakeCpuCores;
     }
-    return orig_get_nprocs ? orig_get_nprocs() : 8;
+    if (orig_get_nprocs) return orig_get_nprocs();
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    return online > 0 ? static_cast<int>(online) : 8;
 }
 
 static int (*orig_get_nprocs_conf)(void) = nullptr;
@@ -167,11 +170,24 @@ static int hooked_get_nprocs_conf(void) {
     if (g_config.enabled && g_config.fakeCpuEnabled && g_config.fakeCpuCores > 0) {
         return g_config.fakeCpuCores;
     }
-    return orig_get_nprocs_conf ? orig_get_nprocs_conf() : 8;
+    if (orig_get_nprocs_conf) return orig_get_nprocs_conf();
+    long conf = sysconf(_SC_NPROCESSORS_CONF);
+    return conf > 0 ? static_cast<int>(conf) : 8;
 }
 
 static int (*orig_open)(const char *pathname, int flags, ...) = nullptr;
-static int hooked_open(const char *pathname, int flags, mode_t mode) {
+static int hooked_open(const char *pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & (O_CREAT
+#ifdef O_TMPFILE
+        | O_TMPFILE
+#endif
+    )) {
+        va_list args;
+        va_start(args, flags);
+        mode = static_cast<mode_t>(va_arg(args, int));
+        va_end(args);
+    }
     if (g_config.enabled && g_config.fakeCpuEnabled && pathname) {
         if (strcmp(pathname, "/proc/cpuinfo") == 0) {
             int fd = createFakeStringFd(generateFakeCpuInfo());
@@ -187,7 +203,18 @@ static int hooked_open(const char *pathname, int flags, mode_t mode) {
 }
 
 static int (*orig_openat)(int dirfd, const char *pathname, int flags, ...) = nullptr;
-static int hooked_openat(int dirfd, const char *pathname, int flags, mode_t mode) {
+static int hooked_openat(int dirfd, const char *pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & (O_CREAT
+#ifdef O_TMPFILE
+        | O_TMPFILE
+#endif
+    )) {
+        va_list args;
+        va_start(args, flags);
+        mode = static_cast<mode_t>(va_arg(args, int));
+        va_end(args);
+    }
     if (g_config.enabled && g_config.fakeCpuEnabled && pathname) {
         if (strcmp(pathname, "/proc/cpuinfo") == 0) {
             int fd = createFakeStringFd(generateFakeCpuInfo());
@@ -271,6 +298,8 @@ static void hooked_glGetIntegerv(GLenum pname, GLint *data) {
 static void (*orig_glViewport)(GLint x, GLint y, GLsizei width, GLsizei height) = nullptr;
 static void hooked_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (g_config.enabled && g_config.resolutionScale > 0.0f && g_config.resolutionScale < 1.0f) {
+        x = static_cast<GLint>(std::round(x * g_config.resolutionScale));
+        y = static_cast<GLint>(std::round(y * g_config.resolutionScale));
         width = static_cast<GLsizei>(std::round(width * g_config.resolutionScale));
         height = static_cast<GLsizei>(std::round(height * g_config.resolutionScale));
     }
@@ -302,36 +331,78 @@ static void hooked_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
 // ---------------------------------------------------------------------------
 // GLSL Shader Engine: Universal Skin Tone & Turf Protection
 // ---------------------------------------------------------------------------
-static std::string findFragOutputVar(const std::string &src) {
-    // Skip MRT GBuffer passes to avoid altering surface normals
-    static const std::regex mrtRegex(R"(layout\s*\(\s*location\s*=\s*[1-9]\s*\)\s*out\b)");
+// ---------------------------------------------------------------------------
+// GLSL Shader Engine: Universal Skin Tone & Turf Protection
+// ---------------------------------------------------------------------------
+struct FragOutputInfo {
+    bool valid = false;
+    bool isGles2 = false; // true if gl_FragColor
+    std::string originalDecl;
+    std::string type;
+    std::string varName;
+};
+
+static FragOutputInfo findFragOutputVar(const std::string &src) {
+    FragOutputInfo info;
+
+    // 1. Skip Depth shaders: depth-only and shadow passes must never have color grading applied
+    if (src.find("gl_FragDepth") != std::string::npos ||
+        src.find("gl_FragDepthEXT") != std::string::npos) {
+        return info;
+    }
+
+    // 2. Skip MRT (Multi-Render Target) & G-Buffer passes (e.g. Normals, Specular, Velocity)
+    if (src.find("gl_FragData") != std::string::npos) {
+        return info;
+    }
+    static const std::regex mrtRegex(R"(layout\s*\([^)]*location\s*=\s*[1-9])");
     if (std::regex_search(src, mrtRegex)) {
-        return "";
+        return info;
     }
-    if (src.find("gl_FragColor") != std::string::npos) {
-        return "gl_FragColor";
-    }
-    static const std::regex layoutOutRegex(R"(layout\s*\([^)]*\)\s*out\s+(?:mediump\s+|highp\s+|lowp\s+)?vec4\s+([a-zA-Z0-9_]+))");
+
+    // 3. Search for GLES 3+ output declarations at global scope:
+    // Case A: layout(location = 0, ...) out vec4 FragColor;
+    static const std::regex layoutOutRegex(R"((layout\s*\([^)]*location\s*=\s*0[^)]*\)\s*out\s+((?:mediump\s+|highp\s+|lowp\s+)?vec4)\s+([a-zA-Z0-9_]+)\s*;))");
     std::smatch match;
     if (std::regex_search(src, match, layoutOutRegex)) {
-        return match[1].str();
+        info.valid = true;
+        info.isGles2 = false;
+        info.originalDecl = match[1].str();
+        info.type = match[2].str();
+        info.varName = match[3].str();
+        return info;
     }
-    static const std::regex simpleOutRegex(R"(\bout\s+(?:mediump\s+|highp\s+|lowp\s+)?vec4\s+([a-zA-Z0-9_]+))");
+
+    // Case B: out vec4 FragColor; (without layout, must end in semicolon to avoid matching function parameters!)
+    static const std::regex simpleOutRegex(R"((\bout\s+((?:mediump\s+|highp\s+|lowp\s+)?vec4)\s+([a-zA-Z0-9_]+)\s*;))");
     if (std::regex_search(src, match, simpleOutRegex)) {
-        return match[1].str();
+        info.valid = true;
+        info.isGles2 = false;
+        info.originalDecl = match[1].str();
+        info.type = match[2].str();
+        info.varName = match[3].str();
+        return info;
     }
-    return "";
+
+    // 4. Search for GLES 2.0 output: gl_FragColor (only if not #version 300+)
+    if (src.find("gl_FragColor") != std::string::npos &&
+        src.find("#version 3") == std::string::npos) {
+        info.valid = true;
+        info.isGles2 = true;
+        info.type = "vec4";
+        info.varName = "gl_FragColor";
+        return info;
+    }
+
+    return info;
 }
 
 std::string injectGlslShaderEffect(const std::string &src) {
     std::string modified = src;
 
-    if (g_config.forceFp16Shaders || g_vsyncUncapActive) {
-        size_t pos = 0;
-        while ((pos = modified.find("highp", pos)) != std::string::npos) {
-            modified.replace(pos, 5, "mediump");
-            pos += 7;
-        }
+    if (g_config.forceFp16Shaders) {
+        static const std::regex highpRegex(R"(\bhighp\b)");
+        modified = std::regex_replace(modified, highpRegex, "mediump");
     }
 
     const std::string &mode = g_config.shaderPreset;
@@ -340,74 +411,117 @@ std::string injectGlslShaderEffect(const std::string &src) {
         return modified;
     }
 
-    std::string outVar = findFragOutputVar(modified);
-    if (outVar.empty()) return modified;
+    FragOutputInfo outInfo = findFragOutputVar(modified);
+    if (!outInfo.valid) return modified;
 
     try {
-        static const std::regex mainRegex(R"(\bvoid\s+main\s*\(\s*(?:void)?\s*\))");
+        // Match the real function definition of main() with opening brace '{'
+        static const std::regex mainRegex(R"(\bvoid\s+main\s*\(\s*(?:void)?\s*\)\s*\{)");
         if (!std::regex_search(modified, mainRegex)) {
             return modified;
         }
 
+        std::string targetVar = outInfo.isGles2 ? "_glt_fake_fragcolor" : outInfo.varName;
         std::string effectCode;
+
         if (mode.find("DLSS 5") != std::string::npos) {
             effectCode =
-                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    mediump vec3 _glt_dlss = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.32), vec3(0.0));\n"
-                "    " + outVar + ".rgb = _glt_dlss * vec3(1.06, 1.07, 1.09);\n";
+                "    mediump float _glt_luma = dot(" + targetVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_dlss = max(mix(vec3(_glt_luma), " + targetVar + ".rgb, 1.32), vec3(0.0));\n"
+                "    " + targetVar + ".rgb = _glt_dlss * vec3(1.06, 1.07, 1.09);\n";
         } else if (mode.find("Vibrant HDR") != std::string::npos) {
             effectCode =
-                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    mediump vec3 _glt_sat = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.36), vec3(0.0));\n"
-                "    " + outVar + ".rgb = _glt_sat * 1.06;\n";
+                "    mediump float _glt_luma = dot(" + targetVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_sat = max(mix(vec3(_glt_luma), " + targetVar + ".rgb, 1.36), vec3(0.0));\n"
+                "    " + targetVar + ".rgb = _glt_sat * 1.06;\n";
         } else if (mode.find("Golden Hour") != std::string::npos) {
             effectCode =
-                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    mediump vec3 _glt_warm = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.25), vec3(0.0));\n"
-                "    " + outVar + ".rgb = _glt_warm * vec3(1.12, 1.03, 0.88);\n";
+                "    mediump float _glt_luma = dot(" + targetVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_warm = max(mix(vec3(_glt_luma), " + targetVar + ".rgb, 1.25), vec3(0.0));\n"
+                "    " + targetVar + ".rgb = _glt_warm * vec3(1.12, 1.03, 0.88);\n";
         } else if (mode.find("ACES Filmic") != std::string::npos) {
             effectCode =
-                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    mediump vec3 _glt_film = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.20), vec3(0.0));\n"
-                "    " + outVar + ".rgb = _glt_film * vec3(1.08, 1.02, 0.94);\n";
+                "    mediump float _glt_luma = dot(" + targetVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_film = max(mix(vec3(_glt_luma), " + targetVar + ".rgb, 1.20), vec3(0.0));\n"
+                "    " + targetVar + ".rgb = _glt_film * vec3(1.08, 1.02, 0.94);\n";
         } else if (mode.find("Cyberpunk Neon") != std::string::npos) {
             effectCode =
-                "    mediump float _glt_luma = dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
-                "    mediump vec3 _glt_neon = max(mix(vec3(_glt_luma), " + outVar + ".rgb, 1.42), vec3(0.0));\n"
-                "    " + outVar + ".rgb = _glt_neon * vec3(0.94, 1.02, 1.16);\n";
+                "    mediump float _glt_luma = dot(" + targetVar + ".rgb, vec3(0.299, 0.587, 0.114));\n"
+                "    mediump vec3 _glt_neon = max(mix(vec3(_glt_luma), " + targetVar + ".rgb, 1.42), vec3(0.0));\n"
+                "    " + targetVar + ".rgb = _glt_neon * vec3(0.94, 1.02, 1.16);\n";
         } else if (mode.find("Cel-Shading") != std::string::npos) {
             effectCode =
-                "    mediump float _glt_luma = max(dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114)), 0.0001);\n"
+                "    mediump float _glt_luma = max(dot(" + targetVar + ".rgb, vec3(0.299, 0.587, 0.114)), 0.0001);\n"
                 "    mediump float _glt_toon = (floor(_glt_luma * 6.0) + 0.5) / 6.0;\n"
-                "    " + outVar + ".rgb = " + outVar + ".rgb * mix(1.0, _glt_toon / _glt_luma, 0.85);\n";
+                "    " + targetVar + ".rgb = " + targetVar + ".rgb * mix(1.0, _glt_toon / _glt_luma, 0.85);\n";
         } else if (mode.find("Night Vision") != std::string::npos) {
             effectCode =
-                "    mediump float _glt_luma = max(dot(" + outVar + ".rgb, vec3(0.299, 0.587, 0.114)), 0.0);\n"
-                "    " + outVar + ".rgb = vec3(0.12, 0.95, 0.22) * pow(_glt_luma, 0.75) * 1.35;\n";
+                "    mediump float _glt_luma = max(dot(" + targetVar + ".rgb, vec3(0.299, 0.587, 0.114)), 0.0);\n"
+                "    " + targetVar + ".rgb = vec3(0.12, 0.95, 0.22) * pow(_glt_luma, 0.75) * 1.35;\n";
         } else if (mode.find("Custom GLSL") != std::string::npos && !g_config.customGlsl.empty()) {
             std::string expr = g_config.customGlsl;
-            size_t p = 0;
-            while ((p = expr.find("color", p)) != std::string::npos) {
-                expr.replace(p, 5, outVar);
-                p += outVar.length();
-            }
+            static const std::regex colorRegex(R"(\bcolor\b)");
+            expr = std::regex_replace(expr, colorRegex, targetVar);
             effectCode = "    " + expr + "\n";
         }
 
-        if (!effectCode.empty()) {
-            modified = std::regex_replace(modified, mainRegex, "void _gltools_orig_main()", std::regex_constants::format_first_only);
-            // Universal Normalized Chromaticity Skin & Turf Protection across ALL presets
+        if (effectCode.empty()) return modified;
+
+        if (outInfo.isGles2) {
+            // GLES 2.0: Redirect gl_FragColor to an in-memory variable so it is NEVER read from hardware register!
+            std::string origMainReplacement =
+                "vec4 _glt_fake_fragcolor = vec4(0.0, 0.0, 0.0, 1.0);\n"
+                "#define gl_FragColor _glt_fake_fragcolor\n"
+                "void _gltools_orig_main() {";
+            modified = std::regex_replace(modified, mainRegex, origMainReplacement, std::regex_constants::format_first_only);
+
             modified +=
-                "\nvoid main() {\n"
+                "\n#undef gl_FragColor\n"
+                "void main() {\n"
                 "    _gltools_orig_main();\n"
-                "    mediump vec3 _glt_orig = " + outVar + ".rgb;\n"
+                "    mediump vec3 _glt_orig = _glt_fake_fragcolor.rgb;\n"
                 "    mediump float _glt_sum = _glt_orig.r + _glt_orig.g + _glt_orig.b + 0.0001;\n"
                 "    mediump vec3 _glt_n = _glt_orig / _glt_sum;\n"
                 "    mediump float _glt_sk = (_glt_n.r > _glt_n.g && _glt_n.g > _glt_n.b && (_glt_n.r - _glt_n.b) > 0.05 && _glt_n.b < 0.35) ? 1.0 : 0.0;\n"
                 "    mediump float _glt_gr = (_glt_n.g > _glt_n.r && _glt_n.g > _glt_n.b) ? 1.0 : 0.0;\n"
                 + effectCode +
-                "    " + outVar + ".rgb = mix(" + outVar + ".rgb, _glt_orig * vec3(1.01, 1.00, 0.99), _glt_sk * 0.90);\n"
-                "    " + outVar + ".rgb = mix(" + outVar + ".rgb, _glt_orig * vec3(0.75, 0.98, 0.82), _glt_gr * 0.45);\n"
+                "    _glt_fake_fragcolor.rgb = mix(_glt_fake_fragcolor.rgb, _glt_orig * vec3(1.01, 1.00, 0.99), _glt_sk * 0.90);\n"
+                "    _glt_fake_fragcolor.rgb = mix(_glt_fake_fragcolor.rgb, _glt_orig * vec3(0.75, 0.98, 0.82), _glt_gr * 0.45);\n"
+                "    _glt_fake_fragcolor.rgb = clamp(_glt_fake_fragcolor.rgb, 0.0, 1.0);\n"
+                "    gl_FragColor = _glt_fake_fragcolor;\n"
+                "}\n";
+        } else {
+            // GLES 3.0+: Replace the write-only 'out' variable declaration with a readable global variable
+            // and assign once to '_glt_real_out' at the very end of main()!
+            std::string declReplacement;
+            if (outInfo.originalDecl.find("layout") != std::string::npos) {
+                declReplacement = "layout(location = 0) out " + outInfo.type + " _glt_real_out;\n" +
+                                  outInfo.type + " " + outInfo.varName + " = " + outInfo.type + "(0.0, 0.0, 0.0, 1.0);";
+            } else {
+                declReplacement = "out " + outInfo.type + " _glt_real_out;\n" +
+                                  outInfo.type + " " + outInfo.varName + " = " + outInfo.type + "(0.0, 0.0, 0.0, 1.0);";
+            }
+
+            size_t declPos = modified.find(outInfo.originalDecl);
+            if (declPos != std::string::npos) {
+                modified.replace(declPos, outInfo.originalDecl.length(), declReplacement);
+            }
+
+            modified = std::regex_replace(modified, mainRegex, "void _gltools_orig_main() {", std::regex_constants::format_first_only);
+
+            modified +=
+                "\nvoid main() {\n"
+                "    _gltools_orig_main();\n"
+                "    mediump vec3 _glt_orig = " + outInfo.varName + ".rgb;\n"
+                "    mediump float _glt_sum = _glt_orig.r + _glt_orig.g + _glt_orig.b + 0.0001;\n"
+                "    mediump vec3 _glt_n = _glt_orig / _glt_sum;\n"
+                "    mediump float _glt_sk = (_glt_n.r > _glt_n.g && _glt_n.g > _glt_n.b && (_glt_n.r - _glt_n.b) > 0.05 && _glt_n.b < 0.35) ? 1.0 : 0.0;\n"
+                "    mediump float _glt_gr = (_glt_n.g > _glt_n.r && _glt_n.g > _glt_n.b) ? 1.0 : 0.0;\n"
+                + effectCode +
+                "    " + outInfo.varName + ".rgb = mix(" + outInfo.varName + ".rgb, _glt_orig * vec3(1.01, 1.00, 0.99), _glt_sk * 0.90);\n"
+                "    " + outInfo.varName + ".rgb = mix(" + outInfo.varName + ".rgb, _glt_orig * vec3(0.75, 0.98, 0.82), _glt_gr * 0.45);\n"
+                "    " + outInfo.varName + ".rgb = clamp(" + outInfo.varName + ".rgb, 0.0, 1.0);\n"
+                "    _glt_real_out = " + outInfo.varName + ";\n"
                 "}\n";
         }
     } catch (...) {
@@ -427,6 +541,34 @@ static GLuint hooked_glCreateShader(GLenum type) {
     return id;
 }
 
+static void (*orig_glCompileShader)(GLuint shader) = nullptr;
+static void hooked_glCompileShader(GLuint shader) {
+    if (orig_glCompileShader) {
+        orig_glCompileShader(shader);
+    }
+    if (g_config.enabled) {
+        typedef void (*PFN_glGetShaderiv)(GLuint, GLenum, GLint*);
+        static PFN_glGetShaderiv p_glGetShaderiv = nullptr;
+        if (!p_glGetShaderiv) {
+            p_glGetShaderiv = (PFN_glGetShaderiv)dlsym(RTLD_DEFAULT, "glGetShaderiv");
+        }
+        typedef void (*PFN_glGetShaderInfoLog)(GLuint, GLsizei, GLsizei*, GLchar*);
+        static PFN_glGetShaderInfoLog p_glGetShaderInfoLog = nullptr;
+        if (!p_glGetShaderInfoLog) {
+            p_glGetShaderInfoLog = (PFN_glGetShaderInfoLog)dlsym(RTLD_DEFAULT, "glGetShaderInfoLog");
+        }
+        if (p_glGetShaderiv && p_glGetShaderInfoLog) {
+            GLint status = 0;
+            p_glGetShaderiv(shader, 0x8B81 /* GL_COMPILE_STATUS */, &status);
+            if (status == 0 /* GL_FALSE */) {
+                char infoLog[2048] = {0};
+                p_glGetShaderInfoLog(shader, sizeof(infoLog) - 1, nullptr, infoLog);
+                LOGE("Shader compilation FAILED: %s", infoLog);
+            }
+        }
+    }
+}
+
 static void (*orig_glShaderSource)(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) = nullptr;
 static void hooked_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
     if (!orig_glShaderSource) return;
@@ -440,6 +582,19 @@ static void hooked_glShaderSource(GLuint shader, GLsizei count, const GLchar *co
         std::lock_guard<std::mutex> lock(g_shaderMutex);
         auto it = g_shaderTypes.find(shader);
         if (it != g_shaderTypes.end()) shaderType = it->second;
+    }
+
+    if (shaderType == 0) {
+        typedef void (*PFN_glGetShaderiv)(GLuint, GLenum, GLint*);
+        static PFN_glGetShaderiv p_glGetShaderiv = nullptr;
+        if (!p_glGetShaderiv) {
+            p_glGetShaderiv = (PFN_glGetShaderiv)dlsym(RTLD_DEFAULT, "glGetShaderiv");
+        }
+        if (p_glGetShaderiv) {
+            GLint type = 0;
+            p_glGetShaderiv(shader, 0x8B4F /* GL_SHADER_TYPE */, &type);
+            shaderType = static_cast<GLenum>(type);
+        }
     }
 
     if (shaderType != 0x8B30 /* GL_FRAGMENT_SHADER */) {
@@ -522,6 +677,7 @@ static void* hooked_eglGetProcAddress(const char *procname) {
         if (strcmp(procname, "glGetIntegerv") == 0) return (void*)hooked_glGetIntegerv;
         if (strcmp(procname, "glViewport") == 0) return (void*)hooked_glViewport;
         if (strcmp(procname, "glCreateShader") == 0) return (void*)hooked_glCreateShader;
+        if (strcmp(procname, "glCompileShader") == 0) return (void*)hooked_glCompileShader;
         if (strcmp(procname, "glShaderSource") == 0) return (void*)hooked_glShaderSource;
         if (strcmp(procname, "glTexParameteri") == 0) return (void*)hooked_glTexParameteri;
         if (strcmp(procname, "glTexParameterf") == 0) return (void*)hooked_glTexParameterf;
@@ -543,6 +699,7 @@ static void* hooked_dlsym(void *handle, const char *symbol) {
         if (strcmp(symbol, "glGetIntegerv") == 0) return (void*)hooked_glGetIntegerv;
         if (strcmp(symbol, "glViewport") == 0) return (void*)hooked_glViewport;
         if (strcmp(symbol, "glCreateShader") == 0) return (void*)hooked_glCreateShader;
+        if (strcmp(symbol, "glCompileShader") == 0) return (void*)hooked_glCompileShader;
         if (strcmp(symbol, "glShaderSource") == 0) return (void*)hooked_glShaderSource;
         if (strcmp(symbol, "glTexParameteri") == 0) return (void*)hooked_glTexParameteri;
         if (strcmp(symbol, "glTexParameterf") == 0) return (void*)hooked_glTexParameterf;
@@ -683,11 +840,14 @@ bool parseConfigString(const std::string &content, GameConfig &outConfig) {
 
 void loadAppConfigFromCompanion(int socketFd, GameConfig &outConfig) {
     if (socketFd < 0) return;
-    char buffer[8192];
-    ssize_t bytesRead = read(socketFd, buffer, sizeof(buffer) - 1);
-    if (bytesRead > 0) {
-        buffer[bytesRead] = '\0';
-        parseConfigString(buffer, outConfig);
+    std::string content;
+    char buffer[4096];
+    ssize_t bytesRead;
+    while ((bytesRead = read(socketFd, buffer, sizeof(buffer))) > 0) {
+        content.append(buffer, static_cast<size_t>(bytesRead));
+    }
+    if (!content.empty()) {
+        parseConfigString(content, outConfig);
     }
 }
 
@@ -715,6 +875,7 @@ static const PltHookTarget g_hookTargets[] = {
     {"glGetIntegerv", (void*)hooked_glGetIntegerv, (void**)&orig_glGetIntegerv},
     {"glViewport", (void*)hooked_glViewport, (void**)&orig_glViewport},
     {"glCreateShader", (void*)hooked_glCreateShader, (void**)&orig_glCreateShader},
+    {"glCompileShader", (void*)hooked_glCompileShader, (void**)&orig_glCompileShader},
     {"glShaderSource", (void*)hooked_glShaderSource, (void**)&orig_glShaderSource},
     {"glTexParameteri", (void*)hooked_glTexParameteri, (void**)&orig_glTexParameteri},
     {"glTexParameterf", (void*)hooked_glTexParameterf, (void**)&orig_glTexParameterf},
@@ -857,6 +1018,7 @@ static void resolveDefaultOriginals() {
         if (!orig_glGetIntegerv) orig_glGetIntegerv = (decltype(orig_glGetIntegerv))dlsym(gles, "glGetIntegerv");
         if (!orig_glViewport) orig_glViewport = (decltype(orig_glViewport))dlsym(gles, "glViewport");
         if (!orig_glCreateShader) orig_glCreateShader = (decltype(orig_glCreateShader))dlsym(gles, "glCreateShader");
+        if (!orig_glCompileShader) orig_glCompileShader = (decltype(orig_glCompileShader))dlsym(gles, "glCompileShader");
         if (!orig_glShaderSource) orig_glShaderSource = (decltype(orig_glShaderSource))dlsym(gles, "glShaderSource");
         if (!orig_glTexParameteri) orig_glTexParameteri = (decltype(orig_glTexParameteri))dlsym(gles, "glTexParameteri");
         if (!orig_glTexParameterf) orig_glTexParameterf = (decltype(orig_glTexParameterf))dlsym(gles, "glTexParameterf");
