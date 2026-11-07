@@ -142,61 +142,69 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadInstalledApps() {
-        appList.clear()
-        val pm = packageManager
-        val installed = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+        Thread {
+            RootConfigManager.refreshAllConfigs()
+            val pm = packageManager
+            val installed = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+            val tempApps = mutableListOf<AppItem>()
 
-        for (app in installed) {
-            if ((app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
-                app.packageName.contains("konami") ||
-                app.packageName.contains("game") ||
-                app.packageName == packageName
-            ) {
-                val name = pm.getApplicationLabel(app).toString()
-                val cfg = RootConfigManager.loadConfig(app.packageName)
-                appList.add(AppItem(name, app.packageName, cfg))
+            for (app in installed) {
+                if ((app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
+                    app.packageName.contains("konami") ||
+                    app.packageName.contains("game") ||
+                    app.packageName == packageName
+                ) {
+                    val name = pm.getApplicationLabel(app).toString()
+                    val cfg = RootConfigManager.getCachedConfig(app.packageName)
+                    tempApps.add(AppItem(name, app.packageName, cfg))
+                }
             }
-        }
 
-        appList.sortWith(compareByDescending<AppItem> { it.config.enabled }.thenBy { it.name.lowercase() })
+            tempApps.sortWith(compareByDescending<AppItem> { it.config.enabled }.thenBy { it.name.lowercase() })
 
-        val adapter = object : ArrayAdapter<AppItem>(this, android.R.layout.simple_list_item_2, android.R.id.text1, appList) {
-            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                val view = super.getView(position, convertView, parent)
-                val item = getItem(position)
-                val text1 = view.findViewById<TextView>(android.R.id.text1)
-                val text2 = view.findViewById<TextView>(android.R.id.text2)
+            runOnUiThread {
+                appList.clear()
+                appList.addAll(tempApps)
 
-                if (item != null) {
-                    val cfg = item.config
-                    if (cfg.enabled) {
-                        val badges = mutableListOf<String>()
-                        if (cfg.renderer.isNotEmpty()) badges.add("GPU: ${cfg.renderer}")
-                        if (cfg.fakeCpuEnabled) badges.add("CPU: ${cfg.fakeCpuCores}C")
-                        if (cfg.targetGlMajor > 0) badges.add("GLES ${cfg.targetGlMajor}.${cfg.targetGlMinor}")
-                        if (cfg.shaderPreset != "None") badges.add("Shader: ${cfg.shaderPreset}")
-                        if (cfg.frameGenMode != "Off") badges.add("FG: ${cfg.frameGenMode}")
-                        text1.text = "${item.name} [ACTIVE]"
-                        text1.setTextColor(Color.parseColor("#2E7D32"))
-                        text2.text = "${item.packageName}\n${badges.joinToString(" | ")}"
-                    } else {
-                        text1.text = item.name
-                        text1.setTextColor(Color.BLACK)
-                        text2.text = item.packageName
+                val adapter = object : ArrayAdapter<AppItem>(this@MainActivity, android.R.layout.simple_list_item_2, android.R.id.text1, appList) {
+                    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                        val view = super.getView(position, convertView, parent)
+                        val item = getItem(position)
+                        val text1 = view.findViewById<TextView>(android.R.id.text1)
+                        val text2 = view.findViewById<TextView>(android.R.id.text2)
+
+                        if (item != null) {
+                            val cfg = item.config
+                            if (cfg.enabled) {
+                                val badges = mutableListOf<String>()
+                                if (cfg.renderer.isNotEmpty()) badges.add("GPU: ${cfg.renderer}")
+                                if (cfg.fakeCpuEnabled) badges.add("CPU: ${cfg.fakeCpuCores}C")
+                                if (cfg.targetGlMajor > 0) badges.add("GLES ${cfg.targetGlMajor}.${cfg.targetGlMinor}")
+                                if (cfg.shaderPreset != "None") badges.add("Shader: ${cfg.shaderPreset}")
+                                if (cfg.frameGenMode != "Off") badges.add("FG: ${cfg.frameGenMode}")
+                                text1.text = "${item.name} [ACTIVE]"
+                                text1.setTextColor(Color.parseColor("#2E7D32"))
+                                text2.text = "${item.packageName}\n${badges.joinToString(" | ")}"
+                            } else {
+                                text1.text = item.name
+                                text1.setTextColor(Color.BLACK)
+                                text2.text = item.packageName
+                            }
+                        }
+                        return view
                     }
                 }
-                return view
-            }
-        }
 
-        appListView.adapter = adapter
-        appListView.setOnItemClickListener { _, _, pos, _ ->
-            val item = appList[pos]
-            val intent = Intent(this, AppDetailActivity::class.java).apply {
-                putExtra("EXTRA_PACKAGE_NAME", item.packageName)
+                appListView.adapter = adapter
+                appListView.setOnItemClickListener { _, _, pos, _ ->
+                    val item = appList[pos]
+                    val intent = Intent(this@MainActivity, AppDetailActivity::class.java).apply {
+                        putExtra("EXTRA_PACKAGE_NAME", item.packageName)
+                    }
+                    startActivity(intent)
+                }
             }
-            startActivity(intent)
-        }
+        }.start()
     }
 
     data class GlesInfo(val vendor: String, val renderer: String, val version: String, val extensions: String)

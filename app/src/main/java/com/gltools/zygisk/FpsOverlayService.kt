@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import android.view.Gravity
 import android.view.Choreographer
 import android.view.WindowManager
@@ -23,6 +24,10 @@ class FpsOverlayService : Service(), Choreographer.FrameCallback {
 
     override fun onCreate() {
         super.onCreate()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            stopSelf()
+            return
+        }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         fpsTextView = TextView(this).apply {
             text = "FPS: --"
